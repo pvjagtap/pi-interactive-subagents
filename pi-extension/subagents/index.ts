@@ -178,40 +178,6 @@ function formatBytes(bytes: number): string {
  * Returns { file, entries, bytes } — `file` is the path that was measured,
  * so callers can lock onto it for subsequent calls.
  */
-function measureSessionProgress(
-  sessionDir: string,
-  existingFiles: Set<string>,
-  trackedFile?: string | null,
-  excludeFiles?: Set<string>,
-): { file: string; entries: number; bytes: number } | null {
-  try {
-    // If we already know which file to track, use it directly
-    if (trackedFile) {
-      const stat = statSync(trackedFile);
-      const raw = readFileSync(trackedFile, "utf8");
-      const entries = raw.split("\n").filter((l) => l.trim()).length;
-      return { file: trackedFile, entries, bytes: stat.size };
-    }
-
-    // Find the newest session file that wasn't there before
-    // and hasn't been claimed by another parallel agent
-    const newFiles = readdirSync(sessionDir)
-      .filter((f) => f.endsWith(".jsonl") && !existingFiles.has(f) && !(excludeFiles?.has(f)))
-      .map((f) => {
-        const p = join(sessionDir, f);
-        return { name: f, path: p, mtime: statSync(p).mtimeMs };
-      })
-      .sort((a, b) => b.mtime - a.mtime);
-    if (newFiles.length === 0) return null;
-    const stat = statSync(newFiles[0].path);
-    const raw = readFileSync(newFiles[0].path, "utf8");
-    const entries = raw.split("\n").filter((l) => l.trim()).length;
-    return { file: newFiles[0].path, entries, bytes: stat.size };
-  } catch {
-    return null;
-  }
-}
-
 /**
  * Result from running a single subagent.
  */
@@ -235,10 +201,7 @@ interface RunningSubagent {
   agent?: string;
   surface: string;
   startTime: number;
-  sessionDir: string;
-  existingSessionFiles: Set<string>;
-  trackedSessionFile?: string;
-
+  sessionFile: string;
   entries?: number;
   bytes?: number;
   forkCleanupFile?: string;
@@ -248,8 +211,7 @@ interface RunningSubagent {
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
 
-/** Shared across all concurrent watchers to prevent multiple agents claiming the same session file. */
-const globalClaimedFiles = new Set<string>();
+
 
 // ── Widget management ──
 
@@ -385,9 +347,13 @@ async function launchSubagent(
   if (!sessionFile) throw new Error("No session file");
 
   const sessionDir = dirname(sessionFile);
-  const existingSessionFiles = new Set(
-    readdirSync(sessionDir).filter((f) => f.endsWith(".jsonl"))
-  );
+
+  // Generate a deterministic session file path for this subagent.
+  // This eliminates race conditions when multiple agents launch simultaneously —
+  // each agent knows exactly which file is theirs.
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 23) + "Z";
+  const uuid = [id, Math.random().toString(16).slice(2, 10), Math.random().toString(16).slice(2, 10), Math.random().toString(16).slice(2, 6)].join("-");
+  const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
@@ -418,7 +384,7 @@ async function launchSubagent(
 
   // Build pi command
   const parts: string[] = ["pi"];
-  parts.push("--session-dir", shellEscape(dirname(sessionFile)));
+  parts.push("--session", shellEscape(subagentSessionFile));
 
   // For fork mode, create a clean copy of the session that excludes
   // the "Use subagent..." meta-message and tool call that triggered this.
@@ -518,8 +484,7 @@ async function launchSubagent(
     agent: params.agent,
     surface,
     startTime,
-    sessionDir,
-    existingSessionFiles,
+    sessionFile: subagentSessionFile,
     forkCleanupFile,
   };
 
@@ -535,58 +500,31 @@ async function launchSubagent(
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
-  onProgress?: (info: { elapsed: string; entries?: number; bytes?: number }) => void,
 ): Promise<SubagentResult> {
-  const { name, task, surface, startTime, sessionDir, existingSessionFiles, forkCleanupFile } = running;
-
-  // Track which session file belongs to THIS agent.
-  // In parallel mode, multiple agents share the same session directory.
-  // Without tracking, they'd all pick the "newest" file (same one).
-  let trackedFile = running.trackedSessionFile ?? null;
+  const { name, task, surface, startTime, sessionFile, forkCleanupFile } = running;
 
   try {
     const exitCode = await pollForExit(surface, signal, {
       interval: 1000,
       onTick() {
-        const elapsed = formatElapsed(Math.floor((Date.now() - startTime) / 1000));
-        const progress = measureSessionProgress(
-          sessionDir, existingSessionFiles,
-          trackedFile, globalClaimedFiles,
-        );
-        if (progress && !trackedFile) {
-          // Lock onto this file and claim it so other parallel agents skip it
-          trackedFile = progress.file;
-          running.trackedSessionFile = progress.file;
-          globalClaimedFiles.add(basename(progress.file));
-        }
         // Update entries/bytes for widget display
-        if (progress) {
-          running.entries = progress.entries;
-          running.bytes = progress.bytes;
-        }
-        onProgress?.({ elapsed, entries: progress?.entries, bytes: progress?.bytes });
+        try {
+          if (existsSync(sessionFile)) {
+            const stat = statSync(sessionFile);
+            const raw = readFileSync(sessionFile, "utf8");
+            running.entries = raw.split("\n").filter((l) => l.trim()).length;
+            running.bytes = stat.size;
+          }
+        } catch {}
       },
     });
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 
-    // Find session file — use tracked file if we already identified it
-    let subSessionFile: { path: string } | undefined;
-    if (trackedFile) {
-      subSessionFile = { path: trackedFile };
-    } else {
-      // Fallback: scan for new files not claimed by other agents
-      const newFiles = readdirSync(sessionDir)
-        .filter((f) => f.endsWith(".jsonl") && !existingSessionFiles.has(f) && !globalClaimedFiles.has(f))
-        .map((f) => ({ name: f, path: join(sessionDir, f), mtime: statSync(join(sessionDir, f)).mtimeMs }))
-        .sort((a, b) => b.mtime - a.mtime);
-      subSessionFile = newFiles[0];
-    }
-
-    // Extract summary
+    // Extract summary from the known session file
     let summary: string;
-    if (subSessionFile) {
-      const allEntries = getNewEntries(subSessionFile.path, 0);
+    if (existsSync(sessionFile)) {
+      const allEntries = getNewEntries(sessionFile, 0);
       summary =
         findLastAssistantMessage(allEntries) ??
         (exitCode !== 0
@@ -606,7 +544,7 @@ async function watchSubagent(
       try { unlinkSync(forkCleanupFile); } catch {}
     }
 
-    return { name, task, summary, sessionFile: subSessionFile?.path, exitCode, elapsed };
+    return { name, task, summary, sessionFile, exitCode, elapsed };
   } catch (err: any) {
     if (forkCleanupFile) {
       try { unlinkSync(forkCleanupFile); } catch {}
@@ -652,7 +590,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       agent.abortController?.abort();
     }
     runningSubagents.clear();
-    globalClaimedFiles.clear();
   });
 
   // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
@@ -1005,19 +942,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       // Register as a running subagent for widget tracking
       const id = Math.random().toString(16).slice(2, 10);
-      const sessionDir = dirname(params.sessionPath);
-      const existingSessionFiles = new Set(
-        readdirSync(sessionDir).filter((f) => f.endsWith(".jsonl"))
-      );
       const running: RunningSubagent = {
         id,
         name,
         task: params.message ?? "resumed session",
         surface,
         startTime,
-        sessionDir,
-        existingSessionFiles,
-        trackedSessionFile: params.sessionPath,
+        sessionFile: params.sessionPath,
       };
       runningSubagents.set(id, running);
       startWidgetRefresh();
@@ -1026,10 +957,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const watcherAbort = new AbortController();
       running.abortController = watcherAbort;
 
-      watchSubagent(running, watcherAbort.signal, ({ entries, bytes }) => {
-        running.entries = entries;
-        running.bytes = bytes;
-      }).then((result) => {
+      watchSubagent(running, watcherAbort.signal).then((result) => {
         updateWidget();
         const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
         const summary =
