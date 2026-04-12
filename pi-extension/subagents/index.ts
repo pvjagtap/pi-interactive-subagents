@@ -543,8 +543,22 @@ async function launchSubagent(
   // Build env prefix: denied tools + subagent identity + config dir propagation
   const envParts: string[] = [];
 
-  // Propagate PI_CODING_AGENT_DIR so subagents use the same config root
-  if (process.env.PI_CODING_AGENT_DIR) {
+  // Resolve PI_CODING_AGENT_DIR: if cwd is set and the target has its own
+  // .pi/agent/, use that as the config root — this gives the sub-agent full
+  // config isolation (its own extensions, skills, models, auth). Otherwise
+  // propagate the parent's PI_CODING_AGENT_DIR.
+  const rawCwdForEnv = params.cwd ?? agentDefs?.cwd ?? null;
+  const cwdIsFromAgentForEnv = !params.cwd && agentDefs?.cwd != null;
+  const cwdBaseForEnv = cwdIsFromAgentForEnv ? getAgentConfigDir() : process.cwd();
+  const resolvedCwdForEnv = rawCwdForEnv
+    ? rawCwdForEnv.startsWith("/")
+      ? rawCwdForEnv
+      : join(cwdBaseForEnv, rawCwdForEnv)
+    : null;
+  const localAgentDir = resolvedCwdForEnv ? join(resolvedCwdForEnv, ".pi", "agent") : null;
+  if (localAgentDir && existsSync(localAgentDir)) {
+    envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(localAgentDir)}`);
+  } else if (process.env.PI_CODING_AGENT_DIR) {
     envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
   }
 
