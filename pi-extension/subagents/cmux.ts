@@ -605,16 +605,29 @@ export function closeSurface(surface: string): void {
   zellijActionSync(["close-pane"], surface);
 }
 
+export interface PollResult {
+  /** How the subagent exited */
+  reason: "done" | "ping" | "sentinel";
+  /** Shell exit code (from sentinel). 0 for file-based exits. */
+  exitCode: number;
+  /** Ping data if reason is "ping" */
+  ping?: { name: string; message: string };
+}
+
 /**
- * Poll a pane until the __SUBAGENT_DONE_N__ sentinel appears.
- * Returns the process exit code embedded in the sentinel.
- * Throws if the signal is aborted before the sentinel is found.
+ * Poll until the subagent exits. Checks for a `.exit` sidecar file first
+ * (written by subagent_done / caller_ping), falling back to the terminal
+ * sentinel for crash detection.
  */
 export async function pollForExit(
   surface: string,
   signal: AbortSignal,
-  options: { interval: number; onTick?: (elapsed: number) => void },
-): Promise<number> {
+  options: {
+    interval: number;
+    sessionFile?: string;
+    onTick?: (elapsed: number) => void;
+  },
+): Promise<PollResult> {
   const start = Date.now();
 
   while (true) {
@@ -622,10 +635,43 @@ export async function pollForExit(
       throw new Error("Aborted while waiting for subagent to finish");
     }
 
-    const screen = await readScreenAsync(surface, 5);
-    const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
-    if (match) {
-      return parseInt(match[1], 10);
+    // Fast path: check for .exit sidecar file (written by subagent_done / caller_ping)
+    if (options.sessionFile) {
+      try {
+        const exitFile = `${options.sessionFile}.exit`;
+        if (existsSync(exitFile)) {
+          const data = JSON.parse(readFileSync(exitFile, "utf8"));
+          rmSync(exitFile, { force: true });
+          if (data.type === "ping") {
+            return { reason: "ping", exitCode: 0, ping: { name: data.name, message: data.message } };
+          }
+          return { reason: "done", exitCode: 0 };
+        }
+      } catch {}
+    }
+
+    // Slow path: read terminal screen for sentinel (crash detection)
+    try {
+      const screen = await readScreenAsync(surface, 5);
+      const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
+      if (match) {
+        return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
+      }
+    } catch {
+      // Surface may have been destroyed — check if .exit file appeared in the meantime
+      if (options.sessionFile) {
+        try {
+          const exitFile = `${options.sessionFile}.exit`;
+          if (existsSync(exitFile)) {
+            const data = JSON.parse(readFileSync(exitFile, "utf8"));
+            rmSync(exitFile, { force: true });
+            if (data.type === "ping") {
+              return { reason: "ping", exitCode: 0, ping: { name: data.name, message: data.message } };
+            }
+            return { reason: "done", exitCode: 0 };
+          }
+        } catch {}
+      }
     }
 
     const elapsed = Math.floor((Date.now() - start) / 1000);

@@ -10,7 +10,6 @@ import {
   writeFileSync,
   existsSync,
   mkdirSync,
-  unlinkSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -213,6 +212,7 @@ interface SubagentResult {
   exitCode: number;
   elapsed: number;
   error?: string;
+  ping?: { name: string; message: string };
 }
 
 /**
@@ -645,8 +645,9 @@ async function watchSubagent(
   const { name, task, surface, startTime, sessionFile } = running;
 
   try {
-    const exitCode = await pollForExit(surface, signal, {
+    const result = await pollForExit(surface, signal, {
       interval: 1000,
+      sessionFile,
       onTick() {
         // Update entries/bytes for widget display
         try {
@@ -657,8 +658,6 @@ async function watchSubagent(
             running.bytes = stat.size;
           }
         } catch {}
-
-
       },
     });
 
@@ -670,20 +669,20 @@ async function watchSubagent(
       const allEntries = getNewEntries(sessionFile, 0);
       summary =
         findLastAssistantMessage(allEntries) ??
-        (exitCode !== 0
-          ? `Sub-agent exited with code ${exitCode}`
+        (result.exitCode !== 0
+          ? `Sub-agent exited with code ${result.exitCode}`
           : "Sub-agent exited without output");
     } else {
       summary =
-        exitCode !== 0
-          ? `Sub-agent exited with code ${exitCode}`
+        result.exitCode !== 0
+          ? `Sub-agent exited with code ${result.exitCode}`
           : "Sub-agent exited without output";
     }
 
     closeSurface(surface);
     runningSubagents.delete(running.id);
 
-    return { name, task, summary, sessionFile, exitCode, elapsed };
+    return { name, task, summary, sessionFile, exitCode: result.exitCode, elapsed, ping: result.ping };
   } catch (err: any) {
     try {
       closeSurface(surface);
@@ -806,29 +805,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
 
-            // Check if this was a caller_ping (child wrote .ping file before exiting)
-            const pingFile = result.sessionFile ? `${result.sessionFile}.ping` : null;
-            let pingData: { name: string; message: string } | null = null;
-            if (pingFile) {
-              try {
-                if (existsSync(pingFile)) {
-                  pingData = JSON.parse(readFileSync(pingFile, "utf8"));
-                  unlinkSync(pingFile);
-                }
-              } catch {}
-            }
-
-            if (pingData) {
+            if (result.ping) {
               // Subagent is requesting help — steer a ping message with session path for resume
               const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
               pi.sendMessage(
                 {
                   customType: "subagent_ping",
-                  content: `Sub-agent "${pingData.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${pingData.message}${sessionRef}`,
+                  content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
                   display: true,
                   details: {
-                    name: pingData.name,
-                    message: pingData.message,
+                    name: result.ping.name,
+                    message: result.ping.message,
                     agent: running.agent,
                     sessionFile: result.sessionFile,
                   },
@@ -1196,6 +1183,25 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget();
+
+            if (result.ping) {
+              const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
+              pi.sendMessage(
+                {
+                  customType: "subagent_ping",
+                  content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
+                  display: true,
+                  details: {
+                    name: result.ping.name,
+                    message: result.ping.message,
+                    sessionFile: params.sessionPath,
+                  },
+                },
+                { triggerTurn: true, deliverAs: "steer" },
+              );
+              return;
+            }
+
             const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
             const summary =
               findLastAssistantMessage(allEntries) ??

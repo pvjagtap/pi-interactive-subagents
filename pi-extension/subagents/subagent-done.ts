@@ -167,11 +167,12 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
-      const pingData = {
+      const exitData = {
+        type: "ping" as const,
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",
         message: params.message,
       };
-      writeFileSync(`${sessionFile}.ping`, JSON.stringify(pingData));
+      writeFileSync(`${sessionFile}.exit`, JSON.stringify(exitData));
 
       ctx.shutdown();
       return {
@@ -190,6 +191,10 @@ export default function (pi: ExtensionAPI) {
       "Your LAST assistant message before calling this becomes the summary returned to the caller.",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      const sessionFile = process.env.PI_SUBAGENT_SESSION;
+      if (sessionFile) {
+        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+      }
       ctx.shutdown();
       return {
         content: [{ type: "text", text: "Shutting down subagent session." }],
