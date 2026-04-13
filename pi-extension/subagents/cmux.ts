@@ -1,6 +1,6 @@
 import { execSync, execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
@@ -489,6 +489,29 @@ export function sendCommand(surface: string, command: string): void {
 
   zellijActionSync(["write-chars", command], surface);
   zellijActionSync(["write", "13"], surface);
+}
+
+/**
+ * Send a long command to a pane by writing it to a temporary script file first.
+ * This avoids terminal line-wrapping issues that break commands exceeding the
+ * pane's column width when sent character-by-character via sendCommand.
+ *
+ * The script is self-cleaning: it removes itself after execution.
+ * Returns the path to the temporary script (for reference / debugging).
+ */
+export function sendLongCommand(surface: string, command: string): string {
+  const scriptDir = join(tmpdir(), "pi-subagent-scripts");
+  mkdirSync(scriptDir, { recursive: true });
+  const scriptPath = join(
+    scriptDir,
+    `cmd-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`,
+  );
+  // Write a bash script that runs the command then cleans itself up
+  writeFileSync(scriptPath, `#!/bin/bash\n${command}\nrm -f ${shellEscape(scriptPath)}\n`, {
+    mode: 0o755,
+  });
+  sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
+  return scriptPath;
 }
 
 /**

@@ -17,11 +17,10 @@ import {
   isMuxAvailable,
   muxSetupHint,
   createSurface,
-  sendCommand,
+  sendLongCommand,
   pollForExit,
   closeSurface,
   shellEscape,
-  exitStatusVar,
   renameCurrentTab,
   renameWorkspace,
 } from "./cmux.ts";
@@ -624,8 +623,8 @@ async function launchSubagent(
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'${exitStatusVar()}'__'`;
-  sendCommand(surface, command);
+  const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
+  sendLongCommand(surface, command);
 
   const running: RunningSubagent = {
     id,
@@ -1168,8 +1167,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
         const resumeEnvPrefix = resumeEnvParts.length > 0 ? resumeEnvParts.join(" ") + " " : "";
 
-        const command = `${resumeEnvPrefix}${parts.join(" ")}${cleanupMsgFile ? `; rm -f ${shellEscape(cleanupMsgFile)}` : ""}; echo '__SUBAGENT_DONE_'${exitStatusVar()}'__'`;
-        sendCommand(surface, command);
+        const command = `${resumeEnvPrefix}${parts.join(" ")}${cleanupMsgFile ? `; rm -f ${shellEscape(cleanupMsgFile)}` : ""}; echo '__SUBAGENT_DONE_'$?'__'`;
+        sendLongCommand(surface, command);
 
         // Register as a running subagent for widget tracking
         const id = Math.random().toString(16).slice(2, 10);
