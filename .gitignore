@@ -2,3 +2,9 @@ node_modules/
 .pi/*
 !.pi/skills/
 !.pi/settings.json
+
+# VS Code local history
+.history/
+
+# Copilot artifacts
+copilot_all_tools.jsonl

@@ -21,10 +21,25 @@ import {
   pollForExit,
   closeSurface,
   shellEscape,
+  shellPath,
+  isPowerShellTarget,
+  exitStatusVar,
   renameCurrentTab,
   renameWorkspace,
 } from "./cmux.ts";
 import { getNewEntries, findLastAssistantMessage } from "./session.ts";
+
+/**
+ * Build an environment variable assignment for the target pane shell.
+ * - PowerShell: `$env:NAME = value;`
+ * - Bash/POSIX: `NAME=value`
+ */
+function envAssign(name: string, value: string): string {
+  if (isPowerShellTarget()) {
+    return `$env:${name} = ${value};`;
+  }
+  return `${name}=${value}`;
+}
 
 const SubagentParams = Type.Object({
   name: Type.String({ description: "Display name for the subagent" }),
@@ -576,23 +591,23 @@ async function launchSubagent(
   // If the target cwd has its own .pi/agent/, use that as the config root.
   // Otherwise propagate the current/global agent dir.
   if (localAgentDir && existsSync(localAgentDir)) {
-    envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(localAgentDir)}`);
+    envParts.push(envAssign("PI_CODING_AGENT_DIR", shellEscape(localAgentDir)));
   } else if (process.env.PI_CODING_AGENT_DIR) {
-    envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
+    envParts.push(envAssign("PI_CODING_AGENT_DIR", shellEscape(process.env.PI_CODING_AGENT_DIR)));
   }
 
   if (denySet.size > 0) {
-    envParts.push(`PI_DENY_TOOLS=${shellEscape([...denySet].join(","))}`);
+    envParts.push(envAssign("PI_DENY_TOOLS", shellEscape([...denySet].join(","))));
   }
-  envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
+  envParts.push(envAssign("PI_SUBAGENT_NAME", shellEscape(params.name)));
   if (params.agent) {
-    envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
+    envParts.push(envAssign("PI_SUBAGENT_AGENT", shellEscape(params.agent)));
   }
   if (agentDefs?.autoExit) {
-    envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
+    envParts.push(envAssign("PI_SUBAGENT_AUTO_EXIT", "1"));
   }
-  envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
-  envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
+  envParts.push(envAssign("PI_SUBAGENT_SESSION", shellEscape(subagentSessionFile)));
+  envParts.push(envAssign("PI_SUBAGENT_SURFACE", shellEscape(surface)));
   const envPrefix = envParts.join(" ") + " ";
 
   // Pass task to the sub-agent.
@@ -619,16 +634,23 @@ async function launchSubagent(
 
   // Resolve cwd — param overrides agent default, supports absolute and relative paths.
   // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.
-  const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
+  const ps = isPowerShellTarget();
+  const cdPrefix = effectiveCwd
+    ? (ps ? `Set-Location ${shellEscape(shellPath(effectiveCwd))}; ` : `cd ${shellEscape(shellPath(effectiveCwd))} && `)
+    : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
+  const sentinel = ps
+    ? `${piCommand}; Write-Host "__SUBAGENT_DONE_$($LASTEXITCODE)__"`
+    : `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
+  const command = sentinel;
+  const scriptExt = ps ? ".ps1" : ".sh";
   const launchScriptName = `${(params.name || "subagent")
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, "")
     .replace(/\s+/g, "-")
     .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
+    .replace(/^-|-$/g, "") || "subagent"}-${id}${scriptExt}`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
   sendLongCommand(surface, command, {
     scriptPath: launchScriptFile,
@@ -1192,11 +1214,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
         const resumeEnvParts: string[] = [];
         if (process.env.PI_CODING_AGENT_DIR) {
-          resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
+          resumeEnvParts.push(envAssign("PI_CODING_AGENT_DIR", shellEscape(process.env.PI_CODING_AGENT_DIR)));
         }
         const resumeEnvPrefix = resumeEnvParts.length > 0 ? resumeEnvParts.join(" ") + " " : "";
 
-        const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const rps = isPowerShellTarget();
+        const resumeCmd = `${resumeEnvPrefix}${parts.join(" ")}`;
+        const command = rps
+          ? `${resumeCmd}; Write-Host "__SUBAGENT_DONE_$($LASTEXITCODE)__"`
+          : `${resumeCmd}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const resumeScriptExt = rps ? ".ps1" : ".sh";
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -1205,7 +1232,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/[^a-z0-9\s-]/g, "")
             .replace(/\s+/g, "-")
             .replace(/-+/g, "-")
-            .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
+            .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}${resumeScriptExt}`,
         );
         sendLongCommand(surface, command, {
           scriptPath: launchScriptFile,

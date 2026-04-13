@@ -125,21 +125,23 @@ export function exitStatusVar(): string {
 /**
  * Returns true when the sub-agent pane shell is PowerShell.
  *
- * psmux spawns whatever default shell the OS provides.
- * On Windows this could be PowerShell, cmd, or bash (Git Bash / MSYS2).
- * We detect the actual shell via the SHELL env var — if it points to bash/zsh/fish,
- * the pane will use that shell, not PowerShell.
+ * IMPORTANT: This checks what shell the **psmux pane** will use, NOT what
+ * the parent process runs in.  On Windows, psmux always spawns PowerShell
+ * (pwsh) panes regardless of whether pi itself is launched from Git Bash,
+ * cmd, or PowerShell.  Environment variables like BASH_VERSION, MSYSTEM,
+ * and SHELL belong to the *parent* process and must NOT be used to infer
+ * the pane shell when running under psmux on Windows.
  */
 export function isPowerShellTarget(): boolean {
+  // psmux on Windows → panes are always PowerShell.
+  if (process.platform === "win32") return true;
+
+  // Non-Windows: use parent shell hints as a best-effort fallback.
   const shell = process.env.SHELL ?? "";
   const shellBase = shell.replace(/\\/g, "/").split("/").pop() ?? "";
-  if (["bash", "bash.exe", "zsh", "zsh.exe", "fish", "fish.exe", "sh", "sh.exe"].includes(shellBase)) {
+  if (["bash", "zsh", "fish", "sh"].includes(shellBase)) {
     return false;
   }
-  if (process.env.BASH_VERSION || process.env.MSYSTEM) {
-    return false;
-  }
-  if (process.platform === "win32") return true;
   return false;
 }
 
