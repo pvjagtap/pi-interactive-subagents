@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import {
   isMuxAvailable,
   muxSetupHint,
@@ -539,7 +540,7 @@ async function launchSubagent(
     );
   }
 
-  const subagentDonePath = join(dirname(new URL(import.meta.url).pathname), "subagent-done.ts");
+  const subagentDonePath = join(dirname(fileURLToPath(import.meta.url)), "subagent-done.ts");
   parts.push("-e", shellEscape(subagentDonePath));
 
   if (effectiveModel) {
@@ -1185,7 +1186,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Load subagent-done extension so the agent can self-terminate if needed
         const subagentDonePath = join(
-          dirname(new URL(import.meta.url).pathname),
+          dirname(fileURLToPath(import.meta.url)),
           "subagent-done.ts",
         );
         parts.push("-e", shellEscape(subagentDonePath));
