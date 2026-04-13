@@ -2,7 +2,7 @@ import { execSync, execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 const execFileAsync = promisify(execFile);
 
@@ -492,22 +492,37 @@ export function sendCommand(surface: string, command: string): void {
 }
 
 /**
- * Send a long command to a pane by writing it to a temporary script file first.
+ * Send a long command to a pane by writing it to a script file first.
  * This avoids terminal line-wrapping issues that break commands exceeding the
  * pane's column width when sent character-by-character via sendCommand.
  *
- * The script is self-cleaning: it removes itself after execution.
- * Returns the path to the temporary script (for reference / debugging).
+ * By default the script is written to a temp directory, but callers can pass a
+ * stable path (for example under session artifacts) so the exact invocation is
+ * preserved for debugging.
+ *
+ * Returns the script path.
  */
-export function sendLongCommand(surface: string, command: string): string {
-  const scriptDir = join(tmpdir(), "pi-subagent-scripts");
-  mkdirSync(scriptDir, { recursive: true });
-  const scriptPath = join(
-    scriptDir,
-    `cmd-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`,
-  );
-  // Write a bash script that runs the command then cleans itself up
-  writeFileSync(scriptPath, `#!/bin/bash\n${command}\nrm -f ${shellEscape(scriptPath)}\n`, {
+export function sendLongCommand(
+  surface: string,
+  command: string,
+  options?: { scriptPath?: string; scriptPreamble?: string },
+): string {
+  const scriptPath =
+    options?.scriptPath ??
+    join(
+      tmpdir(),
+      "pi-subagent-scripts",
+      `cmd-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`,
+    );
+  mkdirSync(dirname(scriptPath), { recursive: true });
+
+  const scriptParts = ["#!/bin/bash"];
+  if (options?.scriptPreamble) {
+    scriptParts.push(options.scriptPreamble.trimEnd());
+  }
+  scriptParts.push(command);
+
+  writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
     mode: 0o755,
   });
   sendCommand(surface, `bash ${shellEscape(scriptPath)}`);

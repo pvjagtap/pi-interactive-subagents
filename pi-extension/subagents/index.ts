@@ -11,7 +11,7 @@ import {
   existsSync,
   mkdirSync,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import {
   isMuxAvailable,
@@ -252,6 +252,7 @@ interface RunningSubagent {
   surface: string;
   startTime: number;
   sessionFile: string;
+  launchScriptFile?: string;
   entries?: number;
   bytes?: number;
   abortController?: AbortController;
@@ -419,6 +420,8 @@ async function launchSubagent(
 
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
+  const sessionId = ctx.sessionManager.getSessionId();
+  const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
   const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
@@ -534,8 +537,6 @@ async function launchSubagent(
   // auto-detect file paths and read their contents.
   if (identityInSystemPrompt && identity) {
     const flag = systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
-    const sessionId = ctx.sessionManager.getSessionId();
-    const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
     const spTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
     const spSafeName = (params.name ?? "subagent")
       .toLowerCase()
@@ -602,8 +603,6 @@ async function launchSubagent(
   if (params.fork) {
     parts.push(shellEscape(fullTask));
   } else {
-    const sessionId = ctx.sessionManager.getSessionId();
-    const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
     const safeName = params.name
       .toLowerCase()
@@ -624,7 +623,22 @@ async function launchSubagent(
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
   const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
-  sendLongCommand(surface, command);
+  const launchScriptName = `${(params.name || "subagent")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
+  const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
+  sendLongCommand(surface, command, {
+    scriptPath: launchScriptFile,
+    scriptPreamble: [
+      `# Subagent launch script for ${params.name}`,
+      `# Generated: ${new Date().toISOString()}`,
+      `# Session: ${subagentSessionFile}`,
+      `# Surface: ${surface}`,
+    ].join("\n"),
+  });
 
   const running: RunningSubagent = {
     id,
@@ -634,6 +648,7 @@ async function launchSubagent(
     surface,
     startTime,
     sessionFile: subagentSessionFile,
+    launchScriptFile,
   };
 
   runningSubagents.set(id, running);
@@ -888,6 +903,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             task: params.task,
             agent: params.agent,
             sessionFile: running.sessionFile,
+            launchScriptFile: running.launchScriptFile,
             status: "started",
           },
         };
@@ -1119,7 +1135,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return new Text(theme.fg("dim", text), 0, 0);
       },
 
-      async execute(_toolCallId, params, _signal, _onUpdate) {
+      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const name = params.name ?? "Resume";
         const startTime = Date.now();
 
@@ -1152,12 +1168,25 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         );
         parts.push("-e", shellEscape(subagentDonePath));
 
-        let cleanupMsgFile: string | undefined;
+        const sessionId = ctx.sessionManager.getSessionId();
+        const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
+
+        let resumeMsgFile: string | undefined;
         if (params.message) {
-          const msgFile = join(tmpdir(), `subagent-resume-${Date.now()}.md`);
-          writeFileSync(msgFile, params.message, "utf8");
-          cleanupMsgFile = msgFile;
-          parts.push(shellEscape(`@${msgFile}`));
+          const msgTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+          resumeMsgFile = join(
+            artifactDir,
+            "subagent-resume",
+            `${name
+              .toLowerCase()
+              .replace(/[^a-z0-9\s-]/g, "")
+              .replace(/\s+/g, "-")
+              .replace(/-+/g, "-")
+              .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}.md`,
+          );
+          mkdirSync(dirname(resumeMsgFile), { recursive: true });
+          writeFileSync(resumeMsgFile, params.message, "utf8");
+          parts.push(shellEscape(`@${resumeMsgFile}`));
         }
 
         // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
@@ -1167,8 +1196,27 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
         const resumeEnvPrefix = resumeEnvParts.length > 0 ? resumeEnvParts.join(" ") + " " : "";
 
-        const command = `${resumeEnvPrefix}${parts.join(" ")}${cleanupMsgFile ? `; rm -f ${shellEscape(cleanupMsgFile)}` : ""}; echo '__SUBAGENT_DONE_'$?'__'`;
-        sendLongCommand(surface, command);
+        const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const launchScriptFile = join(
+          artifactDir,
+          "subagent-scripts",
+          `${name
+            .toLowerCase()
+            .replace(/[^a-z0-9\s-]/g, "")
+            .replace(/\s+/g, "-")
+            .replace(/-+/g, "-")
+            .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
+        );
+        sendLongCommand(surface, command, {
+          scriptPath: launchScriptFile,
+          scriptPreamble: [
+            `# Subagent resume script for ${name}`,
+            `# Generated: ${new Date().toISOString()}`,
+            `# Session: ${params.sessionPath}`,
+            `# Surface: ${surface}`,
+            ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
+          ].join("\n"),
+        });
 
         // Register as a running subagent for widget tracking
         const id = Math.random().toString(16).slice(2, 10);
@@ -1179,6 +1227,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           surface,
           startTime,
           sessionFile: params.sessionPath,
+          launchScriptFile,
         };
         runningSubagents.set(id, running);
         startWidgetRefresh();
@@ -1248,7 +1297,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         return {
           content: [{ type: "text", text: `Session "${name}" resumed.` }],
-          details: { id, name, sessionPath: params.sessionPath, status: "started" },
+          details: {
+            id,
+            name,
+            sessionPath: params.sessionPath,
+            launchScriptFile,
+            status: "started",
+          },
         };
       },
     });
