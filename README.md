@@ -1,6 +1,6 @@
 # pi-interactive-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono) — spawn, orchestrate, and manage sub-agent sessions in multiplexer panes. **Fully non-blocking** — the main agent keeps working while subagents run in the background.
+Async subagents for [pi](https://github.com/badlogic/pi-mono) — spawn, orchestrate, and manage sub-agent sessions in psmux panes on **Windows**. **Fully non-blocking** — the main agent keeps working while subagents run in the background.
 
 https://github.com/user-attachments/assets/30adb156-cfb4-4c47-84ca-dd4aa80cba9f
 
@@ -29,26 +29,13 @@ subagent({ name: "Scout: DB", agent: "scout", task: "Map database schema" });
 pi install git:github.com/HazAT/pi-interactive-subagents
 ```
 
-Supported multiplexers:
+Requires [psmux](https://github.com/nicobailon/psmux) — a tmux-compatible terminal multiplexer written in Rust that works natively on **Windows**.
 
-- [cmux](https://github.com/manaflow-ai/cmux)
-- [tmux](https://github.com/tmux/tmux)
-- [zellij](https://zellij.dev)
-- [WezTerm](https://wezfurlong.org/wezterm/) (terminal emulator with built-in multiplexing)
-
-Start pi inside one of them:
+Start pi inside psmux:
 
 ```bash
-cmux pi
-# or
-tmux new -A -s pi 'pi'
-# or
-zellij --session pi   # then run: pi
-# or
-# just run pi inside WezTerm — no wrapper needed
+psmux new -s pi -- pi
 ```
-
-Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm` to force a specific backend.
 
 ## What's Included
 

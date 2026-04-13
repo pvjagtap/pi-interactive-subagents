@@ -16,7 +16,7 @@ import {
   mergeNewEntries,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape, isCmuxAvailable, isWezTermAvailable } from "../pi-extension/subagents/cmux.ts";
+import { shellEscape, isPsmuxAvailable } from "../pi-extension/subagents/cmux.ts";
 import {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
@@ -372,39 +372,52 @@ describe("subagents widget rendering", () => {
 
 describe("cmux.ts", () => {
   describe("shellEscape", () => {
-    it("wraps in single quotes", () => {
-      assert.equal(shellEscape("hello"), "'hello'");
+    // On Windows (psmux target), shellEscape uses PowerShell double-quote escaping
+    const isPS = process.platform === "win32";
+
+    it("wraps string appropriately", () => {
+      if (isPS) {
+        assert.equal(shellEscape("hello"), '"hello"');
+      } else {
+        assert.equal(shellEscape("hello"), "'hello'");
+      }
     });
 
-    it("escapes single quotes", () => {
-      assert.equal(shellEscape("it's"), "'it'\\''s'");
+    it("escapes quotes", () => {
+      if (isPS) {
+        assert.equal(shellEscape("it's"), '"it\'s"');
+      } else {
+        assert.equal(shellEscape("it's"), "'it'\\''s'");
+      }
     });
 
     it("handles empty string", () => {
-      assert.equal(shellEscape(""), "''");
+      if (isPS) {
+        assert.equal(shellEscape(""), '""');
+      } else {
+        assert.equal(shellEscape(""), "''");
+      }
     });
 
     it("handles special characters", () => {
       const input = 'echo "hello $world" && rm -rf /';
       const escaped = shellEscape(input);
-      assert.ok(escaped.startsWith("'"));
-      assert.ok(escaped.endsWith("'"));
-      // Inside single quotes, everything is literal
-      assert.ok(escaped.includes("$world"));
+      if (isPS) {
+        assert.ok(escaped.startsWith('"'));
+        assert.ok(escaped.endsWith('"'));
+        // PowerShell escapes $ with backtick
+        assert.ok(escaped.includes('`$world'));
+      } else {
+        assert.ok(escaped.startsWith("'"));
+        assert.ok(escaped.endsWith("'"));
+        assert.ok(escaped.includes("$world"));
+      }
     });
   });
 
-  describe("isCmuxAvailable", () => {
-    it("returns boolean based on CMUX_SOCKET_PATH", () => {
-      // Can't easily mock env in node:test, just verify it returns a boolean
-      const result = isCmuxAvailable();
-      assert.equal(typeof result, "boolean");
-    });
-  });
-
-  describe("isWezTermAvailable", () => {
-    it("returns boolean based on WEZTERM_UNIX_SOCKET", () => {
-      const result = isWezTermAvailable();
+  describe("isPsmuxAvailable", () => {
+    it("returns boolean based on PSMUX_SESSION", () => {
+      const result = isPsmuxAvailable();
       assert.equal(typeof result, "boolean");
     });
   });

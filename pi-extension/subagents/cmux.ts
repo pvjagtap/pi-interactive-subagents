@@ -1,12 +1,12 @@
 import { execSync, execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
 const execFileAsync = promisify(execFile);
 
-export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm";
+export type MuxBackend = "psmux";
 
 const commandAvailability = new Map<string, boolean>();
 
@@ -17,7 +17,11 @@ function hasCommand(command: string): boolean {
 
   let available = false;
   try {
-    execSync(`command -v ${command}`, { stdio: "ignore" });
+    if (process.platform === "win32") {
+      execSync(`where ${command}`, { stdio: "ignore" });
+    } else {
+      execSync(`command -v ${command}`, { stdio: "ignore" });
+    }
     available = true;
   } catch {
     available = false;
@@ -27,55 +31,52 @@ function hasCommand(command: string): boolean {
   return available;
 }
 
-function muxPreference(): MuxBackend | null {
-  const pref = (process.env.PI_SUBAGENT_MUX ?? "").trim().toLowerCase();
-  if (pref === "cmux" || pref === "tmux" || pref === "zellij" || pref === "wezterm") return pref;
+/**
+ * Resolve the psmux binary path.
+ * psmux may not be in the inherited PATH (e.g. installed via cargo on Windows
+ * where .cargo/bin is in the User PATH but not in Git Bash's $PATH).
+ * We check well-known install locations as a fallback.
+ */
+let resolvedPsmuxBin: string | null | undefined;
+function getPsmuxBin(): string | null {
+  if (resolvedPsmuxBin !== undefined) return resolvedPsmuxBin;
+
+  if (hasCommand("psmux")) {
+    resolvedPsmuxBin = "psmux";
+    return resolvedPsmuxBin;
+  }
+
+  if (process.platform === "win32") {
+    const home = homedir();
+    const candidates = [
+      join(home, ".cargo", "bin", "psmux.exe"),
+      join(process.env.LOCALAPPDATA ?? "", "psmux", "psmux.exe"),
+      join(process.env.APPDATA ?? "", "npm", "psmux.cmd"),
+      join(home, "scoop", "shims", "psmux.exe"),
+    ];
+    for (const p of candidates) {
+      if (p && existsSync(p)) {
+        resolvedPsmuxBin = p;
+        return resolvedPsmuxBin;
+      }
+    }
+  }
+
+  resolvedPsmuxBin = null;
   return null;
 }
 
-function isCmuxRuntimeAvailable(): boolean {
-  return !!process.env.CMUX_SOCKET_PATH && hasCommand("cmux");
+function isPsmuxRuntimeAvailable(): boolean {
+  if (getPsmuxBin() === null) return false;
+  return !!(process.env.PSMUX_SESSION || (process.platform === "win32" && process.env.TMUX));
 }
 
-function isTmuxRuntimeAvailable(): boolean {
-  return !!process.env.TMUX && hasCommand("tmux");
-}
-
-function isZellijRuntimeAvailable(): boolean {
-  return !!(process.env.ZELLIJ || process.env.ZELLIJ_SESSION_NAME) && hasCommand("zellij");
-}
-
-function isWezTermRuntimeAvailable(): boolean {
-  return !!process.env.WEZTERM_UNIX_SOCKET && hasCommand("wezterm");
-}
-
-export function isCmuxAvailable(): boolean {
-  return isCmuxRuntimeAvailable();
-}
-
-export function isTmuxAvailable(): boolean {
-  return isTmuxRuntimeAvailable();
-}
-
-export function isZellijAvailable(): boolean {
-  return isZellijRuntimeAvailable();
-}
-
-export function isWezTermAvailable(): boolean {
-  return isWezTermRuntimeAvailable();
+export function isPsmuxAvailable(): boolean {
+  return isPsmuxRuntimeAvailable();
 }
 
 export function getMuxBackend(): MuxBackend | null {
-  const pref = muxPreference();
-  if (pref === "cmux") return isCmuxRuntimeAvailable() ? "cmux" : null;
-  if (pref === "tmux") return isTmuxRuntimeAvailable() ? "tmux" : null;
-  if (pref === "zellij") return isZellijRuntimeAvailable() ? "zellij" : null;
-  if (pref === "wezterm") return isWezTermRuntimeAvailable() ? "wezterm" : null;
-
-  if (isCmuxRuntimeAvailable()) return "cmux";
-  if (isTmuxRuntimeAvailable()) return "tmux";
-  if (isZellijRuntimeAvailable()) return "zellij";
-  if (isWezTermRuntimeAvailable()) return "wezterm";
+  if (isPsmuxRuntimeAvailable()) return "psmux";
   return null;
 }
 
@@ -84,28 +85,22 @@ export function isMuxAvailable(): boolean {
 }
 
 export function muxSetupHint(): string {
-  const pref = muxPreference();
-  if (pref === "cmux") {
-    return "Start pi inside cmux (`cmux pi`).";
-  }
-  if (pref === "tmux") {
-    return "Start pi inside tmux (`tmux new -A -s pi 'pi'`).";
-  }
-  if (pref === "zellij") {
-    return "Start pi inside zellij (`zellij --session pi`, then run `pi`).";
-  }
-  if (pref === "wezterm") {
-    return "Start pi inside WezTerm.";
-  }
-  return "Start pi inside cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), or WezTerm.";
+  return "Start pi inside psmux (`psmux new -s pi -- pi`).";
 }
 
 function requireMuxBackend(): MuxBackend {
   const backend = getMuxBackend();
   if (!backend) {
-    throw new Error(`No supported terminal multiplexer found. ${muxSetupHint()}`);
+    throw new Error(`psmux not found or not running. ${muxSetupHint()}`);
   }
   return backend;
+}
+
+/**
+ * Return the psmux binary name/path.
+ */
+function psmuxBin(): string {
+  return getPsmuxBin() ?? "psmux";
 }
 
 /**
@@ -118,14 +113,54 @@ export function isFishShell(): boolean {
 }
 
 /**
- * Return the shell-appropriate exit status variable ($? for bash/zsh, $status for fish).
+ * Return the shell-appropriate exit status variable ($? for bash/zsh, $status for fish,
+ * $LASTEXITCODE for psmux/PowerShell on Windows).
  */
 export function exitStatusVar(): string {
-  return isFishShell() ? "$status" : "$?";
+  if (isFishShell()) return "$status";
+  if (isPowerShellTarget()) return "$LASTEXITCODE";
+  return "$?";
+}
+
+/**
+ * Returns true when the sub-agent pane shell is PowerShell.
+ *
+ * psmux spawns whatever default shell the OS provides.
+ * On Windows this could be PowerShell, cmd, or bash (Git Bash / MSYS2).
+ * We detect the actual shell via the SHELL env var — if it points to bash/zsh/fish,
+ * the pane will use that shell, not PowerShell.
+ */
+export function isPowerShellTarget(): boolean {
+  const shell = process.env.SHELL ?? "";
+  const shellBase = shell.replace(/\\/g, "/").split("/").pop() ?? "";
+  if (["bash", "bash.exe", "zsh", "zsh.exe", "fish", "fish.exe", "sh", "sh.exe"].includes(shellBase)) {
+    return false;
+  }
+  if (process.env.BASH_VERSION || process.env.MSYSTEM) {
+    return false;
+  }
+  if (process.platform === "win32") return true;
+  return false;
 }
 
 export function shellEscape(s: string): string {
+  if (isPowerShellTarget()) {
+    return '"' + s.replace(/`/g, '``').replace(/"/g, '`"').replace(/\$/g, '`$') + '"';
+  }
   return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
+/**
+ * Convert a Windows file path to a format the target shell understands.
+ * - For PowerShell (psmux): keep backslashes as-is.
+ * - For bash-on-Windows: convert `C:\foo\bar` to `/c/foo/bar`
+ *   (MSYS/Git Bash path convention).
+ * - On non-Windows: return as-is.
+ */
+export function shellPath(p: string): string {
+  if (process.platform !== "win32") return p;
+  if (isPowerShellTarget()) return p;
+  return p.replace(/\\/g, "/").replace(/^([A-Za-z]):/, (_m, drive: string) => `/${drive.toLowerCase()}`);
 }
 
 function tailLines(text: string, lines: number): string {
@@ -134,361 +169,98 @@ function tailLines(text: string, lines: number): string {
   return split.slice(-lines).join("\n");
 }
 
-function zellijPaneId(surface: string): string {
-  return surface.startsWith("pane:") ? surface.slice("pane:".length) : surface;
-}
-
-function zellijEnv(surface?: string): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  if (surface) {
-    env.ZELLIJ_PANE_ID = zellijPaneId(surface);
-  }
-  return env;
-}
-
-function waitForFile(path: string, timeoutMs = 5000): string {
-  const sleeper = new Int32Array(new SharedArrayBuffer(4));
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    if (existsSync(path)) {
-      return readFileSync(path, "utf8").trim();
-    }
-    Atomics.wait(sleeper, 0, 0, 20);
-  }
-  throw new Error(`Timed out waiting for zellij pane id file: ${path}`);
-}
-
-function zellijActionSync(args: string[], surface?: string): string {
-  return execFileSync("zellij", ["action", ...args], {
-    encoding: "utf8",
-    env: zellijEnv(surface),
-  });
-}
-
-async function zellijActionAsync(args: string[], surface?: string): Promise<string> {
-  const { stdout } = await execFileAsync("zellij", ["action", ...args], {
-    encoding: "utf8",
-    env: zellijEnv(surface),
-  });
-  return stdout;
-}
-
-/** Tracked subagent pane for cmux — reused across subagent launches. */
-let cmuxSubagentPane: string | null = null;
-
 /**
  * Create a new terminal surface for a subagent.
- *
- * For cmux: the first call creates a right-split pane; subsequent calls add
- * tabs to that same pane (avoiding ever-narrower splits).
- * For tmux/zellij/wezterm: falls back to split behavior.
- *
- * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
+ * Returns a pane identifier (`%12`).
  */
 export function createSurface(name: string): string {
-  const backend = getMuxBackend();
-
-  if (backend === "cmux" && cmuxSubagentPane) {
-    // Verify the pane still exists before adding a tab to it
-    try {
-      const tree = execSync(`cmux tree`, { encoding: "utf8" });
-      if (tree.includes(cmuxSubagentPane)) {
-        return createSurfaceInPane(name, cmuxSubagentPane);
-      }
-    } catch {}
-    // Pane is gone — fall through to create a new split
-    cmuxSubagentPane = null;
-  }
-
-  const surface = createSurfaceSplit(name, "right");
-
-  // For cmux, remember the pane so future subagents become tabs in it
-  if (backend === "cmux") {
-    try {
-      const info = execSync(`cmux identify --surface ${shellEscape(surface)}`, {
-        encoding: "utf8",
-      });
-      const parsed = JSON.parse(info);
-      const paneRef = parsed?.caller?.pane_ref;
-      if (paneRef) {
-        cmuxSubagentPane = paneRef;
-      }
-    } catch {}
-  }
-
-  return surface;
+  return createSurfaceSplit(name, "right");
 }
 
 /**
- * Create a new surface (tab) in an existing cmux pane.
- */
-function createSurfaceInPane(name: string, pane: string): string {
-  const out = execSync(`cmux new-surface --pane ${shellEscape(pane)}`, {
-    encoding: "utf8",
-  }).trim();
-  const match = out.match(/surface:\d+/);
-  if (!match) {
-    throw new Error(`Unexpected cmux new-surface output: ${out}`);
-  }
-  const surface = match[0];
-  execSync(`cmux rename-tab --surface ${shellEscape(surface)} ${shellEscape(name)}`, {
-    encoding: "utf8",
-  });
-  return surface;
-}
-
-/**
- * Create a new split in the given direction from an optional source pane.
- * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
+ * Create a new split in the given direction.
+ * Returns a pane identifier (`%12`).
  */
 export function createSurfaceSplit(
   name: string,
   direction: "left" | "right" | "up" | "down",
   fromSurface?: string,
 ): string {
-  const backend = requireMuxBackend();
-
-  if (backend === "cmux") {
-    const surfaceArg = fromSurface ? ` --surface ${shellEscape(fromSurface)}` : "";
-    const out = execSync(`cmux new-split ${direction}${surfaceArg}`, {
-      encoding: "utf8",
-    }).trim();
-    const match = out.match(/surface:\d+/);
-    if (!match) {
-      throw new Error(`Unexpected cmux new-split output: ${out}`);
-    }
-    const surface = match[0];
-    execSync(`cmux rename-tab --surface ${shellEscape(surface)} ${shellEscape(name)}`, {
-      encoding: "utf8",
-    });
-    return surface;
+  requireMuxBackend();
+  const bin = psmuxBin();
+  const args = ["split-window"];
+  if (direction === "left" || direction === "right") {
+    args.push("-h");
+  } else {
+    args.push("-v");
   }
-
-  if (backend === "tmux") {
-    const args = ["split-window"];
-    if (direction === "left" || direction === "right") {
-      args.push("-h");
-    } else {
-      args.push("-v");
-    }
-    if (direction === "left" || direction === "up") {
-      args.push("-b");
-    }
-    if (fromSurface) {
-      args.push("-t", fromSurface);
-    }
-    args.push("-P", "-F", "#{pane_id}");
-
-    const pane = execFileSync("tmux", args, { encoding: "utf8" }).trim();
-    if (!pane.startsWith("%")) {
-      throw new Error(`Unexpected tmux split-window output: ${pane}`);
-    }
-
-    try {
-      execFileSync("tmux", ["select-pane", "-t", pane, "-T", name], { encoding: "utf8" });
-    } catch {
-      // Optional.
-    }
-    return pane;
-  }
-
-  if (backend === "wezterm") {
-    const args = ["cli", "split-pane"];
-    if (direction === "left") args.push("--left");
-    else if (direction === "right") args.push("--right");
-    else if (direction === "up") args.push("--top");
-    else args.push("--bottom");
-    args.push("--cwd", process.cwd());
-    if (fromSurface) {
-      args.push("--pane-id", fromSurface);
-    }
-    const paneId = execFileSync("wezterm", args, { encoding: "utf8" }).trim();
-    if (!paneId || !/^\d+$/.test(paneId)) {
-      throw new Error(`Unexpected wezterm split-pane output: ${paneId || "(empty)"}`);
-    }
-    try {
-      execFileSync("wezterm", ["cli", "set-tab-title", "--pane-id", paneId, name], {
-        encoding: "utf8",
-      });
-    } catch {
-      // Optional — tab title is cosmetic.
-    }
-    return paneId;
-  }
-
-  // zellij
-  const directionArg = direction === "left" || direction === "right" ? "right" : "down";
-  const tokenPath = join(
-    tmpdir(),
-    `pi-subagent-zellij-pane-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`,
-  );
-  const args = ["new-pane", "--direction", directionArg, "--name", name, "--cwd", process.cwd()];
-
-  try {
-    zellijActionSync(args, fromSurface);
-  } catch {
-    if (!fromSurface) throw new Error("Failed to create zellij pane");
-    zellijActionSync(args);
-  }
-
-  // IMPORTANT: do not pass a long-running command to `new-pane`.
-  // zellij keeps the `action new-pane -- <cmd>` process attached until <cmd>
-  // exits. If <cmd> is an interactive shell, the parent call hangs forever.
-  // Instead, create a normal shell pane first, then ask the focused pane
-  // to print its own $ZELLIJ_PANE_ID into a temp file.
-  const captureIdCmd = `echo "$ZELLIJ_PANE_ID" > ${shellEscape(tokenPath)}`;
-  zellijActionSync(["write-chars", captureIdCmd]);
-  zellijActionSync(["write", "13"]);
-
-  const paneId = waitForFile(tokenPath);
-  try {
-    rmSync(tokenPath, { force: true });
-  } catch {}
-
-  if (!paneId || !/^\d+$/.test(paneId)) {
-    throw new Error(`Unexpected zellij pane id: ${paneId || "(empty)"}`);
-  }
-
-  const surface = `pane:${paneId}`;
-
   if (direction === "left" || direction === "up") {
-    try {
-      zellijActionSync(["move-pane", direction], surface);
-    } catch {
-      // Optional layout polish.
-    }
+    args.push("-b");
+  }
+  if (fromSurface) {
+    args.push("-t", fromSurface);
+  }
+  args.push("-P", "-F", "#{pane_id}");
+
+  const pane = execFileSync(bin, args, { encoding: "utf8" }).trim();
+  if (!pane.startsWith("%")) {
+    throw new Error(`Unexpected psmux split-window output: ${pane}`);
   }
 
   try {
-    zellijActionSync(["rename-pane", name], surface);
+    execFileSync(bin, ["select-pane", "-t", pane, "-T", name], { encoding: "utf8" });
   } catch {
-    // Optional.
+    // Optional — pane title is cosmetic.
   }
-
-  return surface;
+  return pane;
 }
 
 /**
  * Rename the current tab/window.
  */
 export function renameCurrentTab(title: string): void {
-  const backend = requireMuxBackend();
-
-  if (backend === "cmux") {
-    const surfaceId = process.env.CMUX_SURFACE_ID;
-    if (!surfaceId) throw new Error("CMUX_SURFACE_ID not set");
-    execSync(`cmux rename-tab --surface ${shellEscape(surfaceId)} ${shellEscape(title)}`, {
-      encoding: "utf8",
-    });
+  requireMuxBackend();
+  const bin = psmuxBin();
+  if (process.env.PI_SUBAGENT_RENAME_PSMUX_WINDOW !== "1") {
     return;
   }
-
-  if (backend === "tmux") {
-    if (process.env.PI_SUBAGENT_RENAME_TMUX_WINDOW !== "1") {
-      return;
-    }
-    const paneId = process.env.TMUX_PANE;
-    if (!paneId) throw new Error("TMUX_PANE not set");
-    const windowId = execFileSync("tmux", ["display-message", "-p", "-t", paneId, "#{window_id}"], {
-      encoding: "utf8",
-    }).trim();
-    execFileSync("tmux", ["rename-window", "-t", windowId, title], { encoding: "utf8" });
-    return;
-  }
-
-  if (backend === "wezterm") {
-    const paneId = process.env.WEZTERM_PANE;
-    const args = ["cli", "set-tab-title"];
-    if (paneId) args.push("--pane-id", paneId);
-    args.push(title);
-    execFileSync("wezterm", args, { encoding: "utf8" });
-    return;
-  }
-
-  zellijActionSync(["rename-tab", title]);
+  const paneId = process.env.TMUX_PANE ?? process.env.PSMUX_PANE;
+  if (!paneId) throw new Error("PSMUX_PANE/TMUX_PANE not set");
+  const windowId = execFileSync(
+    bin,
+    ["display-message", "-p", "-t", paneId, "#{window_id}"],
+    { encoding: "utf8" },
+  ).trim();
+  execFileSync(bin, ["rename-window", "-t", windowId, title], { encoding: "utf8" });
 }
 
 /**
- * Rename the current workspace/session where supported.
+ * Rename the current workspace/session.
  */
 export function renameWorkspace(title: string): void {
-  const backend = requireMuxBackend();
-
-  if (backend === "cmux") {
-    execSync(`cmux workspace-action --action rename --title ${shellEscape(title)}`, {
-      encoding: "utf8",
-    });
+  requireMuxBackend();
+  const bin = psmuxBin();
+  if (process.env.PI_SUBAGENT_RENAME_PSMUX_SESSION !== "1") {
     return;
   }
-
-  if (backend === "tmux") {
-    if (process.env.PI_SUBAGENT_RENAME_TMUX_SESSION !== "1") {
-      return;
-    }
-
-    const paneId = process.env.TMUX_PANE;
-    if (!paneId) throw new Error("TMUX_PANE not set");
-    const sessionId = execFileSync(
-      "tmux",
-      ["display-message", "-p", "-t", paneId, "#{session_id}"],
-      {
-        encoding: "utf8",
-      },
-    ).trim();
-    execFileSync("tmux", ["rename-session", "-t", sessionId, title], { encoding: "utf8" });
-    return;
-  }
-
-  if (backend === "wezterm") {
-    const paneId = process.env.WEZTERM_PANE;
-    const args = ["cli", "set-window-title"];
-    if (paneId) args.push("--pane-id", paneId);
-    args.push(title);
-    try {
-      execFileSync("wezterm", args, { encoding: "utf8" });
-    } catch {
-      // Optional — window title is cosmetic.
-    }
-    return;
-  }
-
-  // Skip session rename for zellij. rename-session renames the socket file
-  // but the ZELLIJ_SESSION_NAME env var in the parent process keeps the old
-  // name, so all subsequent `zellij action ...` CLI calls fail with
-  // "There is no active session!" because the CLI can't find the socket.
-  // Additionally, pi titles often contain special characters (em dashes,
-  // spaces) that fail zellij's session name validation on lookup.
-  // rename-tab (called separately) is sufficient for user-visible naming.
+  const paneId = process.env.TMUX_PANE ?? process.env.PSMUX_PANE;
+  if (!paneId) throw new Error("PSMUX_PANE/TMUX_PANE not set");
+  const sessionId = execFileSync(
+    bin,
+    ["display-message", "-p", "-t", paneId, "#{session_id}"],
+    { encoding: "utf8" },
+  ).trim();
+  execFileSync(bin, ["rename-session", "-t", sessionId, title], { encoding: "utf8" });
 }
 
 /**
  * Send a command string to a pane and execute it.
  */
 export function sendCommand(surface: string, command: string): void {
-  const backend = requireMuxBackend();
-
-  if (backend === "cmux") {
-    execSync(`cmux send --surface ${shellEscape(surface)} ${shellEscape(command + "\n")}`, {
-      encoding: "utf8",
-    });
-    return;
-  }
-
-  if (backend === "tmux") {
-    execFileSync("tmux", ["send-keys", "-t", surface, "-l", command], { encoding: "utf8" });
-    execFileSync("tmux", ["send-keys", "-t", surface, "Enter"], { encoding: "utf8" });
-    return;
-  }
-
-  if (backend === "wezterm") {
-    execFileSync("wezterm", ["cli", "send-text", "--pane-id", surface, "--no-paste", command + "\n"], {
-      encoding: "utf8",
-    });
-    return;
-  }
-
-  zellijActionSync(["write-chars", command], surface);
-  zellijActionSync(["write", "13"], surface);
+  requireMuxBackend();
+  const bin = psmuxBin();
+  execFileSync(bin, ["send-keys", "-t", surface, "-l", command], { encoding: "utf8" });
+  execFileSync(bin, ["send-keys", "-t", surface, "Enter"], { encoding: "utf8" });
 }
 
 /**
@@ -507,25 +279,33 @@ export function sendLongCommand(
   command: string,
   options?: { scriptPath?: string; scriptPreamble?: string },
 ): string {
+  const ext = isPowerShellTarget() ? ".ps1" : ".sh";
   const scriptPath =
     options?.scriptPath ??
     join(
-      tmpdir(),
+      process.env.TEMP ?? process.env.TMP ?? join(homedir(), ".pi-tmp"),
       "pi-subagent-scripts",
-      `cmd-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`,
+      `cmd-${Date.now()}-${Math.random().toString(16).slice(2, 8)}${ext}`,
     );
   mkdirSync(dirname(scriptPath), { recursive: true });
 
-  const scriptParts = ["#!/bin/bash"];
-  if (options?.scriptPreamble) {
-    scriptParts.push(options.scriptPreamble.trimEnd());
+  if (isPowerShellTarget()) {
+    const scriptParts: string[] = [];
+    if (options?.scriptPreamble) {
+      scriptParts.push(options.scriptPreamble.trimEnd());
+    }
+    scriptParts.push(command);
+    writeFileSync(scriptPath, scriptParts.join("\n") + "\n");
+    sendCommand(surface, `& ${shellEscape(shellPath(scriptPath))}`);
+  } else {
+    const scriptParts = ["#!/bin/bash"];
+    if (options?.scriptPreamble) {
+      scriptParts.push(options.scriptPreamble.trimEnd());
+    }
+    scriptParts.push(command);
+    writeFileSync(scriptPath, scriptParts.join("\n") + "\n", { mode: 0o755 });
+    sendCommand(surface, `bash ${shellEscape(shellPath(scriptPath))}`);
   }
-  scriptParts.push(command);
-
-  writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
-    mode: 0o755,
-  });
-  sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
   return scriptPath;
 }
 
@@ -533,114 +313,36 @@ export function sendLongCommand(
  * Read the screen contents of a pane (sync).
  */
 export function readScreen(surface: string, lines = 50): string {
-  const backend = requireMuxBackend();
-
-  if (backend === "cmux") {
-    return execSync(`cmux read-screen --surface ${shellEscape(surface)} --lines ${lines}`, {
-      encoding: "utf8",
-    });
-  }
-
-  if (backend === "tmux") {
-    return execFileSync(
-      "tmux",
-      ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
-      {
-        encoding: "utf8",
-      },
-    );
-  }
-
-  if (backend === "wezterm") {
-    const raw = execFileSync(
-      "wezterm",
-      ["cli", "get-text", "--pane-id", surface],
-      { encoding: "utf8" },
-    );
-    return tailLines(raw, lines);
-  }
-
-  // Zellij 0.44+: use --pane-id flag + stdout instead of env var + temp file.
-  // The ZELLIJ_PANE_ID env var doesn't reliably target other panes for dump-screen,
-  // and --path may silently fail to create the file. Stdout capture is robust.
-  const paneId = zellijPaneId(surface);
-  const raw = execFileSync(
-    "zellij",
-    ["action", "dump-screen", "--pane-id", paneId],
+  requireMuxBackend();
+  const bin = psmuxBin();
+  return execFileSync(
+    bin,
+    ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
     { encoding: "utf8" },
   );
-  return tailLines(raw, lines);
 }
 
 /**
  * Read the screen contents of a pane (async).
  */
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
-  const backend = requireMuxBackend();
-
-  if (backend === "cmux") {
-    const { stdout } = await execFileAsync(
-      "cmux",
-      ["read-screen", "--surface", surface, "--lines", String(lines)],
-      { encoding: "utf8" },
-    );
-    return stdout;
-  }
-
-  if (backend === "tmux") {
-    const { stdout } = await execFileAsync(
-      "tmux",
-      ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
-      { encoding: "utf8" },
-    );
-    return stdout;
-  }
-
-  if (backend === "wezterm") {
-    const { stdout } = await execFileAsync(
-      "wezterm",
-      ["cli", "get-text", "--pane-id", surface],
-      { encoding: "utf8" },
-    );
-    return tailLines(stdout, lines);
-  }
-
-  // Zellij 0.44+: use --pane-id flag + stdout instead of env var + temp file.
-  const paneId = zellijPaneId(surface);
+  requireMuxBackend();
+  const bin = psmuxBin();
   const { stdout } = await execFileAsync(
-    "zellij",
-    ["action", "dump-screen", "--pane-id", paneId],
+    bin,
+    ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
     { encoding: "utf8" },
   );
-  return tailLines(stdout, lines);
+  return stdout;
 }
 
 /**
  * Close a pane.
  */
 export function closeSurface(surface: string): void {
-  const backend = requireMuxBackend();
-
-  if (backend === "cmux") {
-    execSync(`cmux close-surface --surface ${shellEscape(surface)}`, {
-      encoding: "utf8",
-    });
-    return;
-  }
-
-  if (backend === "tmux") {
-    execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
-    return;
-  }
-
-  if (backend === "wezterm") {
-    execFileSync("wezterm", ["cli", "kill-pane", "--pane-id", surface], {
-      encoding: "utf8",
-    });
-    return;
-  }
-
-  zellijActionSync(["close-pane"], surface);
+  requireMuxBackend();
+  const bin = psmuxBin();
+  execFileSync(bin, ["kill-pane", "-t", surface], { encoding: "utf8" });
 }
 
 export interface PollResult {
