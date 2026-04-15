@@ -10,6 +10,8 @@ import {
   writeFileSync,
   existsSync,
   mkdirSync,
+  copyFileSync,
+  unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -23,6 +25,7 @@ import {
   shellEscape,
   renameCurrentTab,
   renameWorkspace,
+  readScreen,
 } from "./cmux.ts";
 import { getNewEntries, findLastAssistantMessage } from "./session.ts";
 
@@ -740,6 +743,27 @@ async function launchSubagent(
  * the summary from the session file, cleans up the surface,
  * and removes the entry from runningSubagents.
  */
+const CLAUDE_SESSIONS_DIR = join(
+  process.env.HOME ?? "/tmp",
+  ".pi", "agent", "sessions", "claude-code",
+);
+
+function copyClaudeSession(sentinelFile: string): string | null {
+  try {
+    const transcriptFile = sentinelFile + ".transcript";
+    if (!existsSync(transcriptFile)) return null;
+    const transcriptPath = readFileSync(transcriptFile, "utf-8").trim();
+    if (!transcriptPath || !existsSync(transcriptPath)) return null;
+    mkdirSync(CLAUDE_SESSIONS_DIR, { recursive: true });
+    const filename = transcriptPath.split("/").pop() ?? `claude-${Date.now()}.jsonl`;
+    const dest = join(CLAUDE_SESSIONS_DIR, filename);
+    copyFileSync(transcriptPath, dest);
+    return filename;
+  } catch {
+    return null;
+  }
+}
+
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
@@ -750,22 +774,59 @@ async function watchSubagent(
     const result = await pollForExit(surface, signal, {
       interval: 1000,
       sessionFile,
+      sentinelFile: running.sentinelFile,
       onTick() {
-        // Update entries/bytes for widget display
-        try {
-          if (existsSync(sessionFile)) {
-            const stat = statSync(sessionFile);
-            const raw = readFileSync(sessionFile, "utf8");
-            running.entries = raw.split("\n").filter((l) => l.trim()).length;
-            running.bytes = stat.size;
-          }
-        } catch {}
+        if (running.cli !== "claude") {
+          try {
+            if (existsSync(sessionFile)) {
+              const stat = statSync(sessionFile);
+              const raw = readFileSync(sessionFile, "utf8");
+              running.entries = raw.split("\n").filter((l) => l.trim()).length;
+              running.bytes = stat.size;
+            }
+          } catch {}
+        }
       },
     });
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 
-    // Extract summary from the known session file
+    if (running.cli === "claude") {
+      // Claude Code result extraction
+      let summary = "";
+
+      if (running.sentinelFile) {
+        try {
+          summary = readFileSync(running.sentinelFile, "utf-8").trim();
+        } catch {}
+      }
+
+      if (!summary) {
+        summary = readScreen(surface, 200)
+          .replace(/__SUBAGENT_DONE_\d+__/, "")
+          .trimEnd();
+      }
+
+      if (!summary) {
+        summary = result.exitCode !== 0
+          ? `Claude Code exited with code ${result.exitCode}`
+          : "Claude Code exited without output";
+      }
+
+      // Copy Claude session transcript
+      if (running.sentinelFile) {
+        copyClaudeSession(running.sentinelFile);
+        try { unlinkSync(running.sentinelFile); } catch {}
+        try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
+      }
+
+      closeSurface(surface);
+      runningSubagents.delete(running.id);
+
+      return { name, task, summary, exitCode: result.exitCode, elapsed };
+    }
+
+    // Pi subagent result extraction (existing, unchanged)
     let summary: string;
     if (existsSync(sessionFile)) {
       const allEntries = getNewEntries(sessionFile, 0);
