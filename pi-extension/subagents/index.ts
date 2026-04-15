@@ -69,6 +69,7 @@ interface AgentDefaults {
   autoExit?: boolean;
   systemPromptMode?: "append" | "replace";
   cwd?: string;
+  cli?: string;
   body?: string;
 }
 
@@ -166,6 +167,7 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
       spawning: spawningRaw != null ? spawningRaw === "true" : undefined,
       autoExit: autoExitRaw != null ? autoExitRaw === "true" : undefined,
       cwd: get("cwd"),
+      cli: get("cli"),
       body: body || undefined,
     };
   }
