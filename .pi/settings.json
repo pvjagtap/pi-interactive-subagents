@@ -7,7 +7,6 @@
     }
   ],
   "extensions": [
-    "../pi-extension/subagents/index.ts",
-    "../pi-extension/session-artifacts/index.ts"
+    "../pi-extension/subagents/index.ts"
   ]
 }
