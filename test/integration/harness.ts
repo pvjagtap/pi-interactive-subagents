@@ -30,6 +30,7 @@ import {
   readScreen,
   readScreenAsync,
   closeSurface,
+  sendEscape,
   shellEscape,
   type MuxBackend,
 } from "../../pi-extension/subagents/cmux.ts";
@@ -43,6 +44,7 @@ export {
   readScreen,
   readScreenAsync,
   closeSurface,
+  sendEscape,
   shellEscape,
 };
 export type { MuxBackend };
@@ -52,6 +54,19 @@ export type { MuxBackend };
 const HARNESS_DIR = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = resolve(HARNESS_DIR, "../..");
 const TEST_AGENTS_SRC = join(HARNESS_DIR, "agents");
+
+/**
+ * Absolute path to the extension source in the working tree.
+ *
+ * Integration tests must exercise the code on the current branch — NOT the
+ * version installed as a pi-package under `~/.pi/agent/git/...` or the project
+ * mirror under `.pi/git/...`, which stays pinned to the last released tag.
+ *
+ * We force-load this file via `pi -ne -e <path>` in startPi() below so local
+ * edits are always the code under test, regardless of what pi-packages are
+ * installed on the host.
+ */
+const EXTENSION_SOURCE = join(PROJECT_ROOT, "pi-extension", "subagents", "index.ts");
 
 // ── Configuration ──
 
@@ -182,9 +197,15 @@ export function startPi(
   const model = opts?.model ?? TEST_MODEL;
   const extra = opts?.extraArgs ?? "";
 
+  // Force pi to load the working-tree extension (not an installed pi-package
+  // snapshot). `-ne` disables extension auto-discovery, `-e <path>` loads the
+  // current branch's source directly. Without this, the tests silently run
+  // against whatever version is checked out under `~/.pi/agent/git/...`.
   const cmd = [
     `cd ${shellEscape(testDir)} &&`,
     `pi`,
+    `-ne`,
+    `-e ${shellEscape(EXTENSION_SOURCE)}`,
     `--model ${shellEscape(model)}`,
     extra,
     shellEscape(task),
