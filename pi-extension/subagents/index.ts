@@ -106,6 +106,12 @@ const SubagentParams = Type.Object({
         "Force the full-context fork mode for this spawn. The sub-agent inherits the current session conversation, overriding any agent frontmatter session-mode.",
     }),
   ),
+  interactive: Type.Optional(
+    Type.Boolean({
+      description:
+        "Mark the subagent as interactive (long-running, user drives the conversation in its own pane). When true, the main session is not woken by status transitions (stalled/recovered) for this subagent. If omitted, falls back to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit` (agents that auto-exit are autonomous and get stall pings; agents that don't are interactive and stay quiet).",
+    }),
+  ),
   resumeSessionId: Type.Optional(
     Type.String({
       description:
@@ -131,6 +137,7 @@ interface AgentDefaults {
   denyTools?: string;
   spawning?: boolean;
   autoExit?: boolean;
+  interactive?: boolean;
   systemPromptMode?: "append" | "replace";
   sessionMode?: SubagentSessionMode;
   cwd?: string;
@@ -235,6 +242,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     denyTools: getFrontmatterValue(frontmatter, "deny-tools"),
     spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
+    interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
     sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
     cwd: getFrontmatterValue(frontmatter, "cwd"),
     cli: getFrontmatterValue(frontmatter, "cli"),
@@ -319,6 +327,31 @@ function resolveLaunchBehavior(
     inheritsConversationContext,
     taskDelivery: inheritsConversationContext ? "direct" : "artifact",
   };
+}
+
+/**
+ * Decide whether a subagent is interactive (user-driven, long-running).
+ *
+ * Resolution order:
+ *   1. Explicit `interactive` tool parameter wins.
+ *   2. Explicit `interactive` frontmatter field on the agent.
+ *   3. Default: the inverse of `auto-exit`. Agents that auto-exit are
+ *      autonomous (scout, worker, reviewer) and the parent session should be
+ *      woken on stall/recovery transitions. Agents that don't auto-exit are
+ *      driven by the user in their own pane (planner, iterate/fork) and
+ *      stall pings are noise.
+ *
+ * When no agent defs exist at all (bare `subagent({ name, task })` call,
+ * typical for `/iterate` with `fork: true`), `autoExit` is undefined and the
+ * subagent is treated as interactive — matching the intent of iterate.
+ */
+function resolveEffectiveInteractive(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+): boolean {
+  if (params.interactive != null) return params.interactive;
+  if (agentDefs?.interactive != null) return agentDefs.interactive;
+  return !(agentDefs?.autoExit ?? false);
 }
 
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
@@ -457,6 +490,13 @@ interface RunningSubagent {
   cli?: string;
   sentinelFile?: string;
   statusState: SubagentStatusState;
+  /**
+   * When true, status transitions (stalled/recovered) do not wake the parent
+   * session via a steer message. The widget still updates locally. Used for
+   * long-running agents where the user drives the conversation in the
+   * subagent's pane (e.g. planner).
+   */
+  interactive: boolean;
 }
 
 /** All currently running subagents, keyed by id. */
@@ -754,7 +794,11 @@ function startStatusRefresh(pi: ExtensionAPI) {
       }
       running.statusState = nextState;
 
-      if (transition) {
+      // Interactive subagents (long-running, user-driven) intentionally don't
+      // wake the parent session on stalled/recovered transitions — the user is
+      // working in the subagent's pane, and a steer message here would burn an
+      // orchestrator turn on a no-op "still waiting" ping. Widget still updates.
+      if (transition && !running.interactive) {
         transitionLines.push(formatTransitionLine(running.name, snapshot, transition));
       }
     }
@@ -786,6 +830,7 @@ export const __test__ = {
   discoverAgentDefinitions,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
+  resolveEffectiveInteractive,
   buildPiPromptArgs,
   buildWidgetRightLabel,
   isIgnorableSessionProgressError,
@@ -826,6 +871,7 @@ async function launchSubagent(
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
+  const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
@@ -950,6 +996,7 @@ async function launchSubagent(
       launchScriptFile,
       cli: "claude",
       sentinelFile,
+      interactive: effectiveInteractive,
       statusState: createStatusState({
         source: "claude",
         startTimeMs: startTime,
@@ -1093,6 +1140,7 @@ async function launchSubagent(
     launchScriptFile,
     entries: initialProgress?.entries,
     bytes: initialProgress?.bytes,
+    interactive: effectiveInteractive,
     statusState: createStatusState({
       source: "pi",
       startTimeMs: startTime,

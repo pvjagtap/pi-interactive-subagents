@@ -123,6 +123,8 @@ The widget tracks each sub-agent's progress and labels it with a coarse state:
 
 These labels are derived from session-file activity. The `defaultCadenceSeconds` setting controls the idle-time thresholds: with the default of `60`, a run becomes `quiet` after about 1 minute without progress and `stalled` after about 3 minutes. When a run enters `stalled` or recovers from it, the parent agent receives a steer message so it can react. All other status transitions stay in the widget only.
 
+**Interactive subagents stay silent.** Long-running user-driven subagents (e.g. `planner`, or any `/iterate` fork) do not wake the parent session on `stalled`/`recovered` transitions — the user is working directly in the subagent's pane, and a steer message there would just burn an orchestrator turn on a no-op "still waiting" ping. The widget still updates normally. By default, agents with `auto-exit: true` are treated as autonomous and get stall pings; agents without it are treated as interactive and stay quiet. Override per-agent with `interactive: true|false` in frontmatter, or per-spawn with `interactive: true|false` on the tool call.
+
 #### Configuration
 
 Status defaults come from `config.json` in the extension directory. Copy `config.json.example` to get started:
@@ -180,6 +182,7 @@ subagent({ name: "Scout", agent: "scout", statusCadenceSeconds: 30, task: "..." 
 | `task`                 | string  | required       | Task prompt for the sub-agent                                                                     |
 | `agent`                | string  | —              | Load defaults from agent definition                                                               |
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
+| `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
 | `model`                | string  | —              | Override agent's default model                                                                    |
 | `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
@@ -305,7 +308,8 @@ You are a specialized agent that does X...
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
 | `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
-| `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). |
+| `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
+| `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
 
@@ -352,6 +356,32 @@ When set to `true`, the agent session shuts down automatically as soon as the ag
 name: scout
 auto-exit: true
 ---
+```
+
+### `interactive`
+
+Controls whether status transitions (`stalled`, `recovered`) wake the parent session with a steer message.
+
+**Default:** the inverse of `auto-exit`. Autonomous agents (`auto-exit: true`) are non-interactive and ping the parent on stall/recovery; agents without `auto-exit` are interactive and stay quiet. Bare spawns with no agent defs (e.g. `/iterate` with `fork: true`) are treated as interactive.
+
+**Why it exists:** Interactive agents can run for minutes or hours while the user thinks, types, and reads in the subagent's pane. Those natural pauses trip the `stalled` classifier — but the parent session has nothing useful to do with that information, and every transition costs an orchestrator turn. Skipping the steer keeps the parent quiet until the child actually finishes.
+
+**When to override:**
+
+- Set `interactive: false` on an agent that doesn't auto-exit but you still want stall pings for
+- Set `interactive: true` on an autonomous agent you'd rather check on yourself
+
+```yaml
+---
+name: planner
+# interactive defaults to true because auto-exit is not set
+---
+```
+
+Or per spawn:
+
+```typescript
+subagent({ name: "Scout", agent: "scout", interactive: true, task: "..." });
 ```
 
 ---

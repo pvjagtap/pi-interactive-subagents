@@ -721,6 +721,129 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("loads explicit interactive flag from frontmatter", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "interactive-true-test-agent",
+        [
+          "name: interactive-true-test-agent",
+          "model: anthropic/test-interactive-true",
+          "interactive: true",
+        ].join("\n"),
+      );
+      writeAgentFile(
+        projectAgentsDir,
+        "interactive-false-test-agent",
+        [
+          "name: interactive-false-test-agent",
+          "model: anthropic/test-interactive-false",
+          "interactive: false",
+        ].join("\n"),
+      );
+
+      const loadedTrue = testApi.loadAgentDefaults("interactive-true-test-agent");
+      assert.equal(loadedTrue?.interactive, true);
+
+      const loadedFalse = testApi.loadAgentDefaults("interactive-false-test-agent");
+      assert.equal(loadedFalse?.interactive, false);
+    });
+  });
+
+  it("leaves interactive undefined when not set in frontmatter", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "interactive-unset-test-agent",
+        [
+          "name: interactive-unset-test-agent",
+          "model: anthropic/test-interactive-unset",
+        ].join("\n"),
+      );
+
+      const loaded = testApi.loadAgentDefaults("interactive-unset-test-agent");
+      assert.equal(loaded?.interactive, undefined);
+    });
+  });
+
+  it("resolveEffectiveInteractive defaults to the inverse of auto-exit", () => {
+    // Autonomous agents (auto-exit: true) are NOT interactive — parent gets stall pings.
+    assert.equal(
+      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, { autoExit: true }),
+      false,
+    );
+    // Agents without auto-exit ARE interactive — parent stays quiet on stalls.
+    assert.equal(
+      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, { autoExit: false }),
+      true,
+    );
+    assert.equal(
+      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, {}),
+      true,
+    );
+    // Bare spawn with no agent defs (e.g. /iterate fork) is interactive by default.
+    assert.equal(
+      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, null),
+      true,
+    );
+  });
+
+  it("resolveEffectiveInteractive honors explicit frontmatter over the auto-exit default", () => {
+    // Autonomous agent that still wants to be treated as interactive.
+    assert.equal(
+      testApi.resolveEffectiveInteractive(
+        { name: "A", task: "T" },
+        { autoExit: true, interactive: true },
+      ),
+      true,
+    );
+    // Non-auto-exit agent that opts back into stall pings.
+    assert.equal(
+      testApi.resolveEffectiveInteractive(
+        { name: "A", task: "T" },
+        { interactive: false },
+      ),
+      false,
+    );
+  });
+
+  it("resolveEffectiveInteractive honors the explicit tool parameter over all else", () => {
+    assert.equal(
+      testApi.resolveEffectiveInteractive(
+        { name: "A", task: "T", interactive: false },
+        { autoExit: false, interactive: true },
+      ),
+      false,
+    );
+    assert.equal(
+      testApi.resolveEffectiveInteractive(
+        { name: "A", task: "T", interactive: true },
+        { autoExit: true, interactive: false },
+      ),
+      true,
+    );
+  });
+
+  it("bundled scout/worker/reviewer agents resolve as non-interactive; planner resolves as interactive", () => {
+    for (const name of ["scout", "worker", "reviewer"]) {
+      const defs = testApi.loadAgentDefaults(name);
+      assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
+      assert.equal(
+        testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
+        false,
+        `${name} should resolve as non-interactive (autonomous)`,
+      );
+    }
+
+    const planner = testApi.loadAgentDefaults("planner");
+    assert.ok(planner, "expected bundled planner to be discoverable");
+    assert.equal(
+      testApi.resolveEffectiveInteractive({ name: "planner", task: "" }, planner),
+      true,
+      "planner should resolve as interactive (no auto-exit)",
+    );
+  });
+
   it("ignores invalid session-mode values", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
@@ -994,6 +1117,7 @@ describe("subagent interruption", () => {
       surface: "pane-1",
       startTime: 0,
       sessionFile: "worker.jsonl",
+      interactive: false,
       statusState: createStatusState({ source: "pi", startTimeMs: 0, cadenceMs: 30_000 }),
       ...overrides,
     };
