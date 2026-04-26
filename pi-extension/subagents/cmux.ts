@@ -266,6 +266,15 @@ export function sendCommand(surface: string, command: string): void {
 }
 
 /**
+ * Send one Escape keypress to an active pane.
+ */
+export function sendEscape(surface: string): void {
+  requireMuxBackend();
+  const bin = psmuxBin();
+  execFileSync(bin, ["send-keys", "-t", surface, "Escape"], { encoding: "utf8" });
+}
+
+/**
  * Send a long command to a pane by writing it to a script file first.
  * This avoids terminal line-wrapping issues that break commands exceeding the
  * pane's column width when sent character-by-character via sendCommand.
@@ -367,6 +376,7 @@ export async function pollForExit(
   options: {
     interval: number;
     sessionFile?: string;
+    sentinelFile?: string;
     onTick?: (elapsed: number) => void;
   },
 ): Promise<PollResult> {
@@ -388,6 +398,15 @@ export async function pollForExit(
             return { reason: "ping", exitCode: 0, ping: { name: data.name, message: data.message } };
           }
           return { reason: "done", exitCode: 0 };
+        }
+      } catch {}
+    }
+
+    // Check Claude sentinel file (written by plugin Stop hook)
+    if (options.sentinelFile) {
+      try {
+        if (existsSync(options.sentinelFile)) {
+          return { reason: "sentinel", exitCode: 0 };
         }
       } catch {}
     }

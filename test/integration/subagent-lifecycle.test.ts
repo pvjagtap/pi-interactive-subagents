@@ -19,6 +19,8 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   getAvailableBackends,
   setBackend,
@@ -63,7 +65,7 @@ for (const backend of backends) {
 
     it("spawns a subagent that writes a file and verifies the session", async () => {
       const id = uniqueId();
-      const markerFile = `/tmp/pi-integ-echo-${id}.txt`;
+      const markerFile = join(tmpdir(), `pi-integ-echo-${id}.txt`);
       trackTempFile(env, markerFile);
 
       const surface = createTrackedSurface(env, `echo-${id}`);
@@ -113,8 +115,8 @@ for (const backend of backends) {
 
     it("spawns two subagents in parallel and both complete", async () => {
       const id = uniqueId();
-      const fileA = `/tmp/pi-integ-para-${id}-a.txt`;
-      const fileB = `/tmp/pi-integ-para-${id}-b.txt`;
+      const fileA = join(tmpdir(), `pi-integ-para-${id}-a.txt`);
+      const fileB = join(tmpdir(), `pi-integ-para-${id}-b.txt`);
       trackTempFile(env, fileA);
       trackTempFile(env, fileB);
 
@@ -153,7 +155,7 @@ for (const backend of backends) {
 
     it("fork mode creates a child session linked to the parent", async () => {
       const id = uniqueId();
-      const markerFile = `/tmp/pi-integ-fork-${id}.txt`;
+      const markerFile = join(tmpdir(), `pi-integ-fork-${id}.txt`);
       trackTempFile(env, markerFile);
 
       const surface = createTrackedSurface(env, `fork-${id}`);
@@ -235,7 +237,7 @@ for (const backend of backends) {
 
     it("subagent discovers project-local test agents", async () => {
       const id = uniqueId();
-      const markerFile = `/tmp/pi-integ-discovery-${id}.txt`;
+      const markerFile = join(tmpdir(), `pi-integ-discovery-${id}.txt`);
       trackTempFile(env, markerFile);
 
       const surface = createTrackedSurface(env, `discovery-${id}`);
@@ -263,7 +265,7 @@ for (const backend of backends) {
 
     it("passes systemPrompt to subagent", async () => {
       const id = uniqueId();
-      const markerFile = `/tmp/pi-integ-sysprompt-${id}.txt`;
+      const markerFile = join(tmpdir(), `pi-integ-sysprompt-${id}.txt`);
       trackTempFile(env, markerFile);
 
       const surface = createTrackedSurface(env, `sysprompt-${id}`);

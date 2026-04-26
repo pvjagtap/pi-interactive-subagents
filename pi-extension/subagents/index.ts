@@ -10,9 +10,10 @@ import {
   writeFileSync,
   existsSync,
   mkdirSync,
+  copyFileSync,
+  unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import {
   isMuxAvailable,
@@ -21,14 +22,43 @@ import {
   sendLongCommand,
   pollForExit,
   closeSurface,
+  getMuxBackend,
+  sendEscape,
   shellEscape,
   shellPath,
   isPowerShellTarget,
   exitStatusVar,
   renameCurrentTab,
   renameWorkspace,
+  readScreen,
 } from "./cmux.ts";
-import { getNewEntries, findLastAssistantMessage } from "./session.ts";
+import {
+  findLastAssistantMessage,
+  getEntryCount,
+  getNewEntries,
+  seedSubagentSessionFile,
+} from "./session.ts";
+
+// Survive /reload: clear timers and abort poll loops from the previous module load.
+// /reload re-imports this file, giving fresh module-level state, but closures from
+// the old module keep running.
+const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
+const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
+
+{
+  const prevInterval = (globalThis as any)[WIDGET_INTERVAL_KEY];
+  if (prevInterval) {
+    clearInterval(prevInterval);
+    (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
+  }
+  const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
+  if (prevAbort) prevAbort.abort();
+  (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
+}
+
+function getModuleAbortSignal(): AbortSignal {
+  return ((globalThis as any)[POLL_ABORT_KEY] as AbortController).signal;
+}
 
 /**
  * Build an environment variable assignment for the target pane shell.
@@ -70,10 +100,24 @@ const SubagentParams = Type.Object({
   fork: Type.Optional(
     Type.Boolean({
       description:
-        "Fork the current session — sub-agent gets full conversation context. Use for iterate/bugfix patterns.",
+        "Force the full-context fork mode for this spawn. The sub-agent inherits the current session conversation, overriding any agent frontmatter session-mode.",
+    }),
+  ),
+  interactive: Type.Optional(
+    Type.Boolean({
+      description:
+        "Mark the subagent as interactive (long-running, user drives the conversation in its own pane). When true, the main session is not woken by status transitions for this subagent.",
+    }),
+  ),
+  resumeSessionId: Type.Optional(
+    Type.String({
+      description:
+        "Resume a previous Claude Code session by its ID. The session ID is returned in details of every claude tool call.",
     }),
   ),
 });
+
+type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
 interface AgentDefaults {
   model?: string;
@@ -83,13 +127,34 @@ interface AgentDefaults {
   denyTools?: string;
   spawning?: boolean;
   autoExit?: boolean;
+  interactive?: boolean;
   systemPromptMode?: "append" | "replace";
+  sessionMode?: SubagentSessionMode;
   cwd?: string;
+  cli?: string;
   body?: string;
+  disableModelInvocation?: boolean;
+}
+
+type AgentSource = "package" | "global" | "project";
+
+interface AgentDefinition extends AgentDefaults {
+  name: string;
+  description?: string;
+  disableModelInvocation: boolean;
+}
+
+interface ListedAgentDefinition extends AgentDefinition {
+  source: AgentSource;
 }
 
 /** Tools that are gated by `spawning: false` */
-const SPAWNING_TOOLS = new Set(["subagent", "subagents_list", "subagent_resume"]);
+const SPAWNING_TOOLS = new Set([
+  "subagent",
+  "subagent_interrupt",
+  "subagents_list",
+  "subagent_resume",
+]);
 
 /**
  * Resolve the effective set of denied tool names from agent defaults.
@@ -123,6 +188,83 @@ function getAgentConfigDir(): string {
   return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 }
 
+function getBundledAgentsDir(): string {
+  return join(dirname(fileURLToPath(import.meta.url)), "../../agents");
+}
+
+function getFrontmatterValue(frontmatter: string, key: string): string | undefined {
+  const match = frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
+  return match ? match[1].trim() : undefined;
+}
+
+function parseOptionalBoolean(value: string | undefined): boolean | undefined {
+  return value != null ? value === "true" : undefined;
+}
+
+function parseSessionMode(value: string | undefined): SubagentSessionMode | undefined {
+  if (value === "standalone" || value === "lineage-only" || value === "fork") {
+    return value;
+  }
+  return undefined;
+}
+
+function parseAgentDefinition(content: string, fallbackName: string): AgentDefinition | null {
+  const match = content.match(/^---\n([\s\S]*?)\n---/);
+  if (!match) return null;
+
+  const frontmatter = match[1];
+  const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
+  const systemPromptMode = getFrontmatterValue(frontmatter, "system-prompt");
+
+  return {
+    name: getFrontmatterValue(frontmatter, "name") ?? fallbackName,
+    description: getFrontmatterValue(frontmatter, "description"),
+    model: getFrontmatterValue(frontmatter, "model"),
+    tools: getFrontmatterValue(frontmatter, "tools"),
+    systemPromptMode:
+      systemPromptMode === "replace"
+        ? "replace"
+        : systemPromptMode === "append"
+          ? "append"
+          : undefined,
+    skills: getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills"),
+    thinking: getFrontmatterValue(frontmatter, "thinking"),
+    denyTools: getFrontmatterValue(frontmatter, "deny-tools"),
+    spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
+    autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
+    interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
+    sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
+    cwd: getFrontmatterValue(frontmatter, "cwd"),
+    cli: getFrontmatterValue(frontmatter, "cli"),
+    body: body || undefined,
+    disableModelInvocation:
+      getFrontmatterValue(frontmatter, "disable-model-invocation")?.toLowerCase() === "true",
+  };
+}
+
+function discoverAgentDefinitions(): ListedAgentDefinition[] {
+  const agents = new Map<string, ListedAgentDefinition>();
+  const dirs: Array<{ path: string; source: AgentSource }> = [
+    { path: getBundledAgentsDir(), source: "package" },
+    { path: join(getAgentConfigDir(), "agents"), source: "global" },
+    { path: join(process.cwd(), ".pi", "agents"), source: "project" },
+  ];
+
+  for (const { path: dir, source } of dirs) {
+    if (!existsSync(dir)) continue;
+    for (const file of readdirSync(dir).filter((entry) => entry.endsWith(".md"))) {
+      const parsed = parseAgentDefinition(
+        readFileSync(join(dir, file), "utf8"),
+        file.replace(/\.md$/, ""),
+      );
+      if (!parsed) continue;
+      agents.set(parsed.name, { ...parsed, source });
+    }
+  }
+
+  return [...agents.values()];
+}
+
 function resolveSubagentPaths(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
@@ -150,41 +292,64 @@ function getDefaultSessionDirFor(cwd: string, agentDir: string): string {
   return sessionDir;
 }
 
+function resolveEffectiveSessionMode(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+): SubagentSessionMode {
+  if (params.fork) return "fork";
+  return agentDefs?.sessionMode ?? "standalone";
+}
+
+function resolveLaunchBehavior(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+): {
+  sessionMode: SubagentSessionMode;
+  seededSessionMode: "lineage-only" | "fork" | null;
+  inheritsConversationContext: boolean;
+  taskDelivery: "direct" | "artifact";
+} {
+  const sessionMode = resolveEffectiveSessionMode(params, agentDefs);
+  const inheritsConversationContext = sessionMode === "fork";
+  return {
+    sessionMode,
+    seededSessionMode: sessionMode === "standalone" ? null : sessionMode,
+    inheritsConversationContext,
+    taskDelivery: inheritsConversationContext ? "direct" : "artifact",
+  };
+}
+
+/**
+ * Decide whether a subagent is interactive (user-driven, long-running).
+ *
+ * Resolution order:
+ *   1. Explicit `interactive` tool parameter wins.
+ *   2. Explicit `interactive` frontmatter field on the agent.
+ *   3. Default: the inverse of `auto-exit`.
+ */
+function resolveEffectiveInteractive(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+): boolean {
+  if (params.interactive != null) return params.interactive;
+  if (agentDefs?.interactive != null) return agentDefs.interactive;
+  return !(agentDefs?.autoExit ?? false);
+}
+
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
   const configDir = getAgentConfigDir();
   const paths = [
     join(process.cwd(), ".pi", "agents", `${agentName}.md`),
     join(configDir, "agents", `${agentName}.md`),
-    join(dirname(new URL(import.meta.url).pathname), "../../agents", `${agentName}.md`),
+    join(getBundledAgentsDir(), `${agentName}.md`),
   ];
+
   for (const p of paths) {
     if (!existsSync(p)) continue;
-    const content = readFileSync(p, "utf8");
-    const match = content.match(/^---\n([\s\S]*?)\n---/);
-    if (!match) continue;
-    const frontmatter = match[1];
-    const get = (key: string) => {
-      const m = frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
-      return m ? m[1].trim() : undefined;
-    };
-    // Extract body (everything after frontmatter)
-    const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
-    const spawningRaw = get("spawning");
-    const autoExitRaw = get("auto-exit");
-    const spm = get("system-prompt");
-    return {
-      model: get("model"),
-      tools: get("tools"),
-      systemPromptMode: spm === "replace" ? "replace" : spm === "append" ? "append" : undefined,
-      skills: get("skill") ?? get("skills"),
-      thinking: get("thinking"),
-      denyTools: get("deny-tools"),
-      spawning: spawningRaw != null ? spawningRaw === "true" : undefined,
-      autoExit: autoExitRaw != null ? autoExitRaw === "true" : undefined,
-      cwd: get("cwd"),
-      body: body || undefined,
-    };
+    const parsed = parseAgentDefinition(readFileSync(p, "utf8"), agentName);
+    if (parsed) return parsed;
   }
+
   return null;
 }
 
@@ -195,16 +360,20 @@ function formatElapsed(seconds: number): string {
   return `${m}m ${s}s`;
 }
 
-function muxUnavailableResult(kind: "subagents" | "tab-title" = "subagents") {
-  if (kind === "tab-title") {
-    return {
-      content: [
-        { type: "text" as const, text: `Terminal multiplexer not available. ${muxSetupHint()}` },
-      ],
-      details: { error: "mux not available" },
-    };
-  }
+/**
+ * Wait long enough for a freshly created pane to finish shell startup.
+ *
+ * Some environments do extra shell-init work before the prompt is ready
+ * (for example direnv/devenv), so the delay is configurable for users who hit
+ * dropped commands. Keep the historical default at 500ms.
+ */
+function getShellReadyDelayMs(): number {
+  const raw = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS?.trim();
+  const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
+}
 
+function muxUnavailableResult() {
   return {
     content: [
       {
@@ -234,15 +403,50 @@ function formatBytes(bytes: number): string {
 }
 
 /**
- * Try to find and measure a specific session file, or discover
- * the right one from new files in the session directory.
+ * Build the positional prompt args for a Pi CLI subagent launch.
  *
- * When `trackedFile` is provided, measures that file directly.
- * Otherwise scans for new files not in `existingFiles` or `excludeFiles`.
+ * In artifact-backed launches (lineage-only, standalone), Pi's buildInitialMessage()
+ * concatenates @file content with messages[0] into one initial prompt. That breaks
+ * /skill: expansion because the message no longer starts with "/skill:". Only
+ * messages[1..] are sent as separate follow-up prompts where /skill: is recognized.
  *
- * Returns { file, entries, bytes } — `file` is the path that was measured,
- * so callers can lock onto it for subsequent calls.
+ * When there are skill prompts AND artifact-backed delivery, we prepend an empty
+ * first positional message so that /skill: args land in messages[1..] and arrive
+ * as standalone prompts in the child session.
  */
+function buildPiPromptArgs(params: {
+  effectiveSkills?: string;
+  taskDelivery: "direct" | "artifact";
+  taskArg: string;
+}): string[] {
+  const skillPrompts = (params.effectiveSkills ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((skill) => `/skill:${skill}`);
+
+  const needsSeparator = params.taskDelivery === "artifact" && skillPrompts.length > 0;
+
+  return [
+    ...(needsSeparator ? [""] : []),
+    ...skillPrompts,
+    params.taskArg,
+  ];
+}
+
+function resolveResultPresentation(
+  result: Pick<SubagentResult, "exitCode" | "elapsed" | "summary" | "sessionFile">,
+  name: string,
+): string {
+  const sessionRef = result.sessionFile
+    ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
+    : "";
+
+  return result.exitCode !== 0
+    ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`
+    : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`;
+}
+
 /**
  * Result from running a single subagent.
  */
@@ -251,6 +455,7 @@ interface SubagentResult {
   task: string;
   summary: string;
   sessionFile?: string;
+  claudeSessionId?: string;
   exitCode: number;
   elapsed: number;
   error?: string;
@@ -272,6 +477,14 @@ interface RunningSubagent {
   entries?: number;
   bytes?: number;
   abortController?: AbortController;
+  cli?: string;
+  sentinelFile?: string;
+  /**
+   * When true, status transitions do not wake the parent
+   * session via a steer message. Used for long-running agents where
+   * the user drives the conversation in the subagent's pane.
+   */
+  interactive: boolean;
 }
 
 /** All currently running subagents, keyed by id. */
@@ -383,6 +596,7 @@ function updateWidget() {
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
+      (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
     }
     return;
   }
@@ -401,9 +615,92 @@ function updateWidget() {
   );
 }
 
+function resolveInterruptTarget(params: { id?: string; name?: string }):
+  | { running: RunningSubagent }
+  | { error: string } {
+  const requestedId = params.id?.trim();
+  if (requestedId) {
+    const running = runningSubagents.get(requestedId);
+    return running ? { running } : { error: `No running subagent with id "${requestedId}".` };
+  }
+
+  const requestedName = params.name?.trim();
+  if (!requestedName) {
+    return { error: "Provide a running subagent id or exact display name." };
+  }
+
+  const matches = Array.from(runningSubagents.values()).filter((running) => running.name === requestedName);
+  if (matches.length === 1) return { running: matches[0] };
+  if (matches.length === 0) {
+    return { error: `No running subagent named "${requestedName}".` };
+  }
+
+  const candidates = matches.map((running) => `${running.name} [${running.id}]`).join(", ");
+  return { error: `Ambiguous subagent name "${requestedName}". Matches: ${candidates}` };
+}
+
+function requestSubagentInterrupt(
+  running: RunningSubagent,
+  sendEscapeKey: (surface: string) => void = sendEscape,
+): { ok: true } | { error: string } {
+  try {
+    sendEscapeKey(running.surface);
+    return { ok: true };
+  } catch (error: any) {
+    const backend = getMuxBackend() ?? "unknown";
+    return {
+      error:
+        `Failed to send Escape to subagent "${running.name}" via ${backend}: ` +
+        `${error?.message ?? String(error)}`,
+    };
+  }
+}
+
+function handleSubagentInterrupt(
+  params: { id?: string; name?: string },
+  sendEscapeKey: (surface: string) => void = sendEscape,
+) {
+  const resolved = resolveInterruptTarget(params);
+  if ("error" in resolved) {
+    return {
+      content: [{ type: "text" as const, text: resolved.error }],
+      details: { error: resolved.error },
+    };
+  }
+
+  const running = resolved.running;
+  const interruption = requestSubagentInterrupt(running, sendEscapeKey);
+  if ("error" in interruption) {
+    return {
+      content: [{ type: "text" as const, text: interruption.error }],
+      details: { error: interruption.error, id: running.id, name: running.name },
+    };
+  }
+
+  updateWidget();
+
+  return {
+    content: [{ type: "text" as const, text: `Interrupt requested for subagent "${running.name}".` }],
+    details: { id: running.id, name: running.name, status: "interrupt_requested" },
+  };
+}
+
 export const __test__ = {
   borderLine,
+  getShellReadyDelayMs,
   renderSubagentWidgetLines,
+  loadAgentDefaults,
+  discoverAgentDefinitions,
+  resolveEffectiveSessionMode,
+  resolveLaunchBehavior,
+  resolveEffectiveInteractive,
+  buildPiPromptArgs,
+  resolveResultPresentation,
+  resolveDenyTools,
+  resolveInterruptTarget,
+  requestSubagentInterrupt,
+  handleSubagentInterrupt,
+  runningSubagents,
 };
 
 function startWidgetRefresh() {
@@ -460,7 +757,7 @@ async function launchSubagent(
   const surfacePreCreated = !!options?.surface;
   const surface = options?.surface ?? createSurface(params.name);
   if (!surfacePreCreated) {
-    await new Promise<void>((resolve) => setTimeout(resolve, 500));
+    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
 
   // Build the task message
@@ -497,47 +794,12 @@ async function launchSubagent(
   // We write a new session header + cleaned entries (excluding the meta-message
   // that triggered this fork). The sub-agent launches with just --session.
   if (params.fork) {
-    const raw = readFileSync(sessionFile, "utf8");
-    const lines = raw.split("\n").filter((l) => l.trim());
-
-    // Walk backwards to find the last user message (the meta-instruction)
-    // and truncate everything from there onwards
-    let truncateAt = lines.length;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      try {
-        const entry = JSON.parse(lines[i]);
-        if (entry.type === "message" && entry.message?.role === "user") {
-          truncateAt = i;
-          break;
-        }
-      } catch {}
-    }
-
-    // Separate header from content entries
-    const cleanLines = lines.slice(0, truncateAt);
-    const contentLines = cleanLines.filter((l) => {
-      try {
-        return JSON.parse(l).type !== "session";
-      } catch {
-        return true;
-      }
+    seedSubagentSessionFile({
+      mode: "fork",
+      parentSessionFile: sessionFile,
+      childSessionFile: subagentSessionFile,
+      childCwd: targetCwdForSession,
     });
-
-    // Write new session header + cleaned entries to the subagent session file
-    const newHeader = JSON.stringify({
-      type: "session",
-      version: 3,
-      id: randomUUID(),
-      timestamp: new Date().toISOString(),
-      cwd: process.cwd(),
-      parentSession: sessionFile,
-    });
-    mkdirSync(dirname(subagentSessionFile), { recursive: true });
-    writeFileSync(
-      subagentSessionFile,
-      newHeader + "\n" + contentLines.join("\n") + "\n",
-      "utf8",
-    );
   }
 
   const subagentDonePath = join(dirname(fileURLToPath(import.meta.url)), "subagent-done.ts");
@@ -672,6 +934,7 @@ async function launchSubagent(
     startTime,
     sessionFile: subagentSessionFile,
     launchScriptFile,
+    interactive: resolveEffectiveInteractive(params, agentDefs),
   };
 
   runningSubagents.set(id, running);
@@ -819,7 +1082,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Validate prerequisites
         if (!isMuxAvailable()) {
-          return muxUnavailableResult("subagents");
+          return muxUnavailableResult();
         }
 
         if (!ctx.sessionManager.getSessionFile()) {
@@ -873,10 +1136,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             const sessionRef = result.sessionFile
               ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
               : "";
-            const content =
-              result.exitCode !== 0
-                ? `Sub-agent "${running.name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`
-                : `Sub-agent "${running.name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`;
+            const content = resolveResultPresentation(result, running.name);
 
             pi.sendMessage(
               {
@@ -995,49 +1255,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       parameters: Type.Object({}),
 
       async execute() {
-        const agents = new Map<
-          string,
-          { name: string; description?: string; model?: string; source: string }
-        >();
+        const list = discoverAgentDefinitions();
 
-        const dirs = [
-          {
-            path: join(dirname(new URL(import.meta.url).pathname), "../../agents"),
-            source: "package",
-          },
-          { path: join(getAgentConfigDir(), "agents"), source: "global" },
-          { path: join(process.cwd(), ".pi", "agents"), source: "project" },
-        ];
-
-        for (const { path: dir, source } of dirs) {
-          if (!existsSync(dir)) continue;
-          for (const file of readdirSync(dir).filter((f) => f.endsWith(".md"))) {
-            const content = readFileSync(join(dir, file), "utf8");
-            const match = content.match(/^---\n([\s\S]*?)\n---/);
-            if (!match) continue;
-            const frontmatter = match[1];
-            const get = (key: string) => {
-              const m = frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
-              return m ? m[1].trim() : undefined;
-            };
-            const name = get("name") ?? file.replace(/\.md$/, "");
-            agents.set(name, {
-              name,
-              description: get("description"),
-              model: get("model"),
-              source,
-            });
-          }
-        }
-
-        if (agents.size === 0) {
+        if (list.length === 0) {
           return {
             content: [{ type: "text", text: "No subagent definitions found." }],
             details: { agents: [] },
           };
         }
 
-        const list = [...agents.values()];
         const lines = list.map((a) => {
           const badge = a.source === "project" ? " (project)" : "";
           const desc = a.description ? ` — ${a.description}` : "";
@@ -1086,7 +1312,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       async execute(_toolCallId, params) {
         if (!isMuxAvailable()) {
-          return muxUnavailableResult("tab-title");
+          return muxUnavailableResult();
         }
         try {
           renameCurrentTab(params.title);
@@ -1101,6 +1327,24 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             details: { error: err?.message },
           };
         }
+      },
+    });
+
+  // ── subagent_interrupt tool ──
+  if (shouldRegister("subagent_interrupt"))
+    pi.registerTool({
+      name: "subagent_interrupt",
+      label: "Interrupt Subagent",
+      description:
+        "Send an Escape keypress to a running subagent to interrupt its current turn. " +
+        "Provide either the subagent id or exact display name.",
+      parameters: Type.Object({
+        id: Type.Optional(Type.String({ description: "Running subagent id" })),
+        name: Type.Optional(Type.String({ description: "Running subagent display name" })),
+      }),
+
+      async execute(_toolCallId, params) {
+        return handleSubagentInterrupt(params);
       },
     });
 
@@ -1163,7 +1407,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const startTime = Date.now();
 
         if (!isMuxAvailable()) {
-          return muxUnavailableResult("subagents");
+          return muxUnavailableResult();
         }
 
         if (!existsSync(params.sessionPath)) {
@@ -1179,7 +1423,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
         const surface = createSurface(name);
-        await new Promise<void>((resolve) => setTimeout(resolve, 500));
+        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
         // Build pi resume command
         const parts = ["pi", "--session", shellEscape(params.sessionPath)];
@@ -1256,6 +1500,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           startTime,
           sessionFile: params.sessionPath,
           launchScriptFile,
+          interactive: true,
         };
         runningSubagents.set(id, running);
         startWidgetRefresh();

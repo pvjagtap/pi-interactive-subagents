@@ -12,6 +12,8 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   getAvailableBackends,
   setBackend,
@@ -151,7 +153,7 @@ for (const backend of backends) {
       await sleep(1000);
 
       const marker = uniqueId();
-      const filePath = `/tmp/pi-mux-test-${marker}.txt`;
+      const filePath = join(tmpdir(), `pi-mux-test-${marker}.txt`);
 
       sendCommand(surface, `echo "FILE_${marker}" > ${filePath} && echo "WRITTEN_${marker}"`);
       await sleep(1500);

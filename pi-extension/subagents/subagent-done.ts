@@ -12,6 +12,13 @@ export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
 }
 
+export function parseDeniedTools(rawValue: string | undefined): string[] {
+  return (rawValue ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
 export function shouldAutoExitOnAgentEnd(
   userTookOver: boolean,
   messages: any[] | undefined,
@@ -38,6 +45,7 @@ export default function (pi: ExtensionAPI) {
   // Read subagent identity from env vars (set by parent orchestrator)
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
+  const deniedToolsValue = process.env.PI_DENY_TOOLS;
 
   function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
     ctx.ui.setWidget(
@@ -96,10 +104,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
-    denied = (process.env.PI_DENY_TOOLS ?? "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
+    denied = parseDeniedTools(deniedToolsValue);
 
     renderWidget(ctx, null);
   });
