@@ -44,6 +44,7 @@ import {
 // the old module keep running.
 const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
 const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
+const EXIT_HANDLER_KEY = Symbol.for("pi-subagents/exit-handler");
 
 {
   const prevInterval = (globalThis as any)[WIDGET_INTERVAL_KEY];
@@ -54,6 +55,12 @@ const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
   const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
   if (prevAbort) prevAbort.abort();
   (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
+
+  // Remove previous exit handler on /reload to avoid stacking
+  const prevExitHandler = (globalThis as any)[EXIT_HANDLER_KEY];
+  if (prevExitHandler) {
+    process.removeListener("exit", prevExitHandler);
+  }
 }
 
 function getModuleAbortSignal(): AbortSignal {
@@ -489,6 +496,24 @@ interface RunningSubagent {
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
+
+/**
+ * Emergency cleanup: close all subagent panes on process exit.
+ * This handles crashes (uncaught exceptions, TUI render errors) where
+ * session_shutdown never fires and watchSubagent() never completes.
+ * The 'exit' event is synchronous-only, so we use closeSurface (sync).
+ */
+function emergencyCleanupHandler() {
+  for (const [_id, agent] of runningSubagents) {
+    try {
+      closeSurface(agent.surface);
+    } catch {
+      // Best-effort — surface may already be gone
+    }
+  }
+}
+process.on("exit", emergencyCleanupHandler);
+(globalThis as any)[EXIT_HANDLER_KEY] = emergencyCleanupHandler;
 
 // ── Widget management ──
 

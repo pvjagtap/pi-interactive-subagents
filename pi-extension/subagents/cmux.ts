@@ -6,7 +6,7 @@ import { basename, dirname, join } from "node:path";
 
 const execFileAsync = promisify(execFile);
 
-export type MuxBackend = "psmux";
+export type MuxBackend = "psmux" | "wezterm";
 
 const commandAvailability = new Map<string, boolean>();
 
@@ -66,17 +66,70 @@ function getPsmuxBin(): string | null {
   return null;
 }
 
+/**
+ * Resolve the wezterm binary path.
+ * Checks PATH first, then well-known install locations on Windows.
+ */
+let resolvedWeztermBin: string | null | undefined;
+function getWeztermBin(): string | null {
+  if (resolvedWeztermBin !== undefined) return resolvedWeztermBin;
+
+  if (hasCommand("wezterm")) {
+    resolvedWeztermBin = "wezterm";
+    return resolvedWeztermBin;
+  }
+
+  if (process.platform === "win32") {
+    // Check WEZTERM_EXECUTABLE env (points to wezterm-gui.exe) — derive wezterm.exe from its dir
+    const weztermExe = process.env.WEZTERM_EXECUTABLE;
+    if (weztermExe) {
+      const weztermDir = dirname(weztermExe);
+      const candidate = join(weztermDir, "wezterm.exe");
+      if (existsSync(candidate)) {
+        resolvedWeztermBin = candidate;
+        return resolvedWeztermBin;
+      }
+    }
+
+    // Check common install locations
+    const candidates = [
+      join(process.env.LOCALAPPDATA ?? "", "Programs", "WezTerm", "wezterm.exe"),
+      join(process.env.ProgramFiles ?? "", "WezTerm", "wezterm.exe"),
+    ];
+    for (const p of candidates) {
+      if (p && existsSync(p)) {
+        resolvedWeztermBin = p;
+        return resolvedWeztermBin;
+      }
+    }
+  }
+
+  resolvedWeztermBin = null;
+  return null;
+}
+
 function isPsmuxRuntimeAvailable(): boolean {
   if (getPsmuxBin() === null) return false;
   return !!(process.env.PSMUX_SESSION || (process.platform === "win32" && process.env.TMUX));
+}
+
+function isWeztermRuntimeAvailable(): boolean {
+  if (getWeztermBin() === null) return false;
+  // WEZTERM_PANE is set inside WezTerm panes
+  return process.env.WEZTERM_PANE != null;
 }
 
 export function isPsmuxAvailable(): boolean {
   return isPsmuxRuntimeAvailable();
 }
 
+export function isWeztermAvailable(): boolean {
+  return isWeztermRuntimeAvailable();
+}
+
 export function getMuxBackend(): MuxBackend | null {
   if (isPsmuxRuntimeAvailable()) return "psmux";
+  if (isWeztermRuntimeAvailable()) return "wezterm";
   return null;
 }
 
@@ -85,13 +138,13 @@ export function isMuxAvailable(): boolean {
 }
 
 export function muxSetupHint(): string {
-  return "Start pi inside psmux (`psmux new -s pi -- pi`).";
+  return "Start pi inside psmux (`psmux new -s pi -- pi`) or WezTerm.";
 }
 
 function requireMuxBackend(): MuxBackend {
   const backend = getMuxBackend();
   if (!backend) {
-    throw new Error(`psmux not found or not running. ${muxSetupHint()}`);
+    throw new Error(`No supported terminal multiplexer found. ${muxSetupHint()}`);
   }
   return backend;
 }
@@ -101,6 +154,13 @@ function requireMuxBackend(): MuxBackend {
  */
 function psmuxBin(): string {
   return getPsmuxBin() ?? "psmux";
+}
+
+/**
+ * Return the wezterm binary name/path.
+ */
+function weztermBin(): string {
+  return getWeztermBin() ?? "wezterm";
 }
 
 /**
@@ -125,15 +185,19 @@ export function exitStatusVar(): string {
 /**
  * Returns true when the sub-agent pane shell is PowerShell.
  *
- * IMPORTANT: This checks what shell the **psmux pane** will use, NOT what
- * the parent process runs in.  On Windows, psmux always spawns PowerShell
- * (pwsh) panes regardless of whether pi itself is launched from Git Bash,
- * cmd, or PowerShell.  Environment variables like BASH_VERSION, MSYSTEM,
- * and SHELL belong to the *parent* process and must NOT be used to infer
- * the pane shell when running under psmux on Windows.
+ * IMPORTANT: This checks what shell the **mux pane** will use, NOT what
+ * the parent process runs in.
+ *
+ * - psmux on Windows → panes are always PowerShell.
+ * - WezTerm on Windows → panes inherit the default shell (usually PowerShell).
+ *
+ * Environment variables like BASH_VERSION, MSYSTEM, and SHELL belong to the
+ * *parent* process and must NOT be used to infer the pane shell when running
+ * under psmux on Windows.
  */
 export function isPowerShellTarget(): boolean {
   // psmux on Windows → panes are always PowerShell.
+  // WezTerm on Windows → panes default to PowerShell.
   if (process.platform === "win32") return true;
 
   // Non-Windows: use parent shell hints as a best-effort fallback.
@@ -173,22 +237,79 @@ function tailLines(text: string, lines: number): string {
 
 /**
  * Create a new terminal surface for a subagent.
- * Returns a pane identifier (`%12`).
+ * For WezTerm: spawns a new tab (full-width, avoids narrow-pane TUI crashes).
+ * For psmux: creates a split pane.
+ * Returns a pane identifier (`%12` for psmux, numeric string for wezterm).
  */
 export function createSurface(name: string): string {
+  const backend = requireMuxBackend();
+
+  if (backend === "wezterm") {
+    const bin = weztermBin();
+    // Spawn a new tab instead of splitting — each subagent gets full terminal width
+    const paneId = execFileSync(bin, ["cli", "spawn"], { encoding: "utf8" }).trim();
+    if (!paneId || isNaN(Number(paneId))) {
+      throw new Error(`Unexpected wezterm spawn output: ${paneId}`);
+    }
+    // Set tab title for easy identification
+    try {
+      execFileSync(bin, ["cli", "set-tab-title", "--pane-id", paneId, name], { encoding: "utf8" });
+    } catch {
+      // Optional — title is cosmetic.
+    }
+    return paneId;
+  }
+
+  // psmux: fall back to split
   return createSurfaceSplit(name, "right");
 }
 
 /**
  * Create a new split in the given direction.
- * Returns a pane identifier (`%12`).
+ * Returns a pane identifier (`%12` for psmux, numeric string for wezterm).
  */
 export function createSurfaceSplit(
   name: string,
   direction: "left" | "right" | "up" | "down",
   fromSurface?: string,
 ): string {
-  requireMuxBackend();
+  const backend = requireMuxBackend();
+
+  if (backend === "wezterm") {
+    const bin = weztermBin();
+    const args = ["cli", "split-pane"];
+    // Map directions to wezterm flags
+    switch (direction) {
+      case "right":
+        args.push("--right");
+        break;
+      case "left":
+        args.push("--left");
+        break;
+      case "up":
+        args.push("--top");
+        break;
+      case "down":
+        args.push("--bottom");
+        break;
+    }
+    if (fromSurface) {
+      args.push("--pane-id", fromSurface);
+    }
+    const paneId = execFileSync(bin, args, { encoding: "utf8" }).trim();
+    if (!paneId || isNaN(Number(paneId))) {
+      throw new Error(`Unexpected wezterm split-pane output: ${paneId}`);
+    }
+    // Set pane title via tab title
+    try {
+      execFileSync(bin, ["cli", "set-tab-title", "--pane-id", paneId, name], { encoding: "utf8" });
+    } catch {
+      // Optional — title is cosmetic.
+    }
+    return paneId;
+  }
+
+  // psmux backend
   const bin = psmuxBin();
   const args = ["split-window"];
   if (direction === "left" || direction === "right") {
@@ -221,7 +342,17 @@ export function createSurfaceSplit(
  * Rename the current tab/window.
  */
 export function renameCurrentTab(title: string): void {
-  requireMuxBackend();
+  const backend = requireMuxBackend();
+
+  if (backend === "wezterm") {
+    const bin = weztermBin();
+    const paneId = process.env.WEZTERM_PANE;
+    if (!paneId) throw new Error("WEZTERM_PANE not set");
+    execFileSync(bin, ["cli", "set-tab-title", "--pane-id", paneId, title], { encoding: "utf8" });
+    return;
+  }
+
+  // psmux backend
   const bin = psmuxBin();
   if (process.env.PI_SUBAGENT_RENAME_PSMUX_WINDOW !== "1") {
     return;
@@ -240,7 +371,21 @@ export function renameCurrentTab(title: string): void {
  * Rename the current workspace/session.
  */
 export function renameWorkspace(title: string): void {
-  requireMuxBackend();
+  const backend = requireMuxBackend();
+
+  if (backend === "wezterm") {
+    const bin = weztermBin();
+    const paneId = process.env.WEZTERM_PANE;
+    if (!paneId) throw new Error("WEZTERM_PANE not set");
+    try {
+      execFileSync(bin, ["cli", "rename-workspace", "--pane-id", paneId, title], { encoding: "utf8" });
+    } catch {
+      // rename-workspace may not be supported in older WezTerm versions
+    }
+    return;
+  }
+
+  // psmux backend
   const bin = psmuxBin();
   if (process.env.PI_SUBAGENT_RENAME_PSMUX_SESSION !== "1") {
     return;
@@ -259,7 +404,18 @@ export function renameWorkspace(title: string): void {
  * Send a command string to a pane and execute it.
  */
 export function sendCommand(surface: string, command: string): void {
-  requireMuxBackend();
+  const backend = requireMuxBackend();
+
+  if (backend === "wezterm") {
+    const bin = weztermBin();
+    // send-text sends text as if pasted; append \r\n to execute
+    execFileSync(bin, ["cli", "send-text", "--pane-id", surface, "--no-paste", command + "\r\n"], {
+      encoding: "utf8",
+    });
+    return;
+  }
+
+  // psmux backend
   const bin = psmuxBin();
   execFileSync(bin, ["send-keys", "-t", surface, "-l", command], { encoding: "utf8" });
   execFileSync(bin, ["send-keys", "-t", surface, "Enter"], { encoding: "utf8" });
@@ -269,7 +425,18 @@ export function sendCommand(surface: string, command: string): void {
  * Send one Escape keypress to an active pane.
  */
 export function sendEscape(surface: string): void {
-  requireMuxBackend();
+  const backend = requireMuxBackend();
+
+  if (backend === "wezterm") {
+    const bin = weztermBin();
+    // Send ESC character (\x1b)
+    execFileSync(bin, ["cli", "send-text", "--pane-id", surface, "--no-paste", "\x1b"], {
+      encoding: "utf8",
+    });
+    return;
+  }
+
+  // psmux backend
   const bin = psmuxBin();
   execFileSync(bin, ["send-keys", "-t", surface, "Escape"], { encoding: "utf8" });
 }
@@ -324,7 +491,19 @@ export function sendLongCommand(
  * Read the screen contents of a pane (sync).
  */
 export function readScreen(surface: string, lines = 50): string {
-  requireMuxBackend();
+  const backend = requireMuxBackend();
+
+  if (backend === "wezterm") {
+    const bin = weztermBin();
+    // get-text with --start-line for scrollback; negative = scrollback lines
+    return execFileSync(
+      bin,
+      ["cli", "get-text", "--pane-id", surface, "--start-line", `-${Math.max(1, lines)}`],
+      { encoding: "utf8" },
+    );
+  }
+
+  // psmux backend
   const bin = psmuxBin();
   return execFileSync(
     bin,
@@ -337,7 +516,19 @@ export function readScreen(surface: string, lines = 50): string {
  * Read the screen contents of a pane (async).
  */
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
-  requireMuxBackend();
+  const backend = requireMuxBackend();
+
+  if (backend === "wezterm") {
+    const bin = weztermBin();
+    const { stdout } = await execFileAsync(
+      bin,
+      ["cli", "get-text", "--pane-id", surface, "--start-line", `-${Math.max(1, lines)}`],
+      { encoding: "utf8" },
+    );
+    return stdout;
+  }
+
+  // psmux backend
   const bin = psmuxBin();
   const { stdout } = await execFileAsync(
     bin,
@@ -351,7 +542,15 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
  * Close a pane.
  */
 export function closeSurface(surface: string): void {
-  requireMuxBackend();
+  const backend = requireMuxBackend();
+
+  if (backend === "wezterm") {
+    const bin = weztermBin();
+    execFileSync(bin, ["cli", "kill-pane", "--pane-id", surface], { encoding: "utf8" });
+    return;
+  }
+
+  // psmux backend
   const bin = psmuxBin();
   execFileSync(bin, ["kill-pane", "-t", surface], { encoding: "utf8" });
 }
