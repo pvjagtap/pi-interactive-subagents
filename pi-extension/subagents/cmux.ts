@@ -128,6 +128,11 @@ export function isWeztermAvailable(): boolean {
 }
 
 export function getMuxBackend(): MuxBackend | null {
+  // Allow user override via env var (e.g. PI_MUX_BACKEND=wezterm when both are available)
+  const override = process.env.PI_MUX_BACKEND?.trim().toLowerCase();
+  if (override === "psmux" && isPsmuxRuntimeAvailable()) return "psmux";
+  if (override === "wezterm" && isWeztermRuntimeAvailable()) return "wezterm";
+
   if (isPsmuxRuntimeAvailable()) return "psmux";
   if (isWeztermRuntimeAvailable()) return "wezterm";
   return null;
@@ -300,11 +305,11 @@ export function createSurfaceSplit(
     if (!paneId || isNaN(Number(paneId))) {
       throw new Error(`Unexpected wezterm split-pane output: ${paneId}`);
     }
-    // Set pane title via tab title
+    // For splits, the new pane shares the parent's tab — use set-pane-title (not set-tab-title)
     try {
-      execFileSync(bin, ["cli", "set-tab-title", "--pane-id", paneId, name], { encoding: "utf8" });
+      execFileSync(bin, ["cli", "set-pane-title", "--pane-id", paneId, name], { encoding: "utf8" });
     } catch {
-      // Optional — title is cosmetic.
+      // Older WezTerm versions may not support set-pane-title; fall back silently.
     }
     return paneId;
   }
@@ -408,8 +413,10 @@ export function sendCommand(surface: string, command: string): void {
 
   if (backend === "wezterm") {
     const bin = weztermBin();
-    // send-text sends text as if pasted; append \r\n to execute
-    execFileSync(bin, ["cli", "send-text", "--pane-id", surface, "--no-paste", command + "\r\n"], {
+    // --no-paste sends raw text; append newline to execute.
+    // Use \r\n on Windows (PowerShell), \n on Unix (bash/zsh) to avoid ^M artifacts.
+    const nl = process.platform === "win32" ? "\r\n" : "\n";
+    execFileSync(bin, ["cli", "send-text", "--pane-id", surface, "--no-paste", command + nl], {
       encoding: "utf8",
     });
     return;
@@ -539,10 +546,12 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
 }
 
 /**
- * Close a pane.
+ * Close a pane. Tolerates missing backend (returns silently) so it's safe
+ * to call from process exit handlers where env vars may already be gone.
  */
 export function closeSurface(surface: string): void {
-  const backend = requireMuxBackend();
+  const backend = getMuxBackend();
+  if (!backend) return; // Backend unavailable (e.g. during process teardown)
 
   if (backend === "wezterm") {
     const bin = weztermBin();
