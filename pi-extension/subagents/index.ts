@@ -1091,9 +1091,34 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   const shouldRegister = (name: string) => !deniedTools.has(name);
 
+  /**
+   * Terminal-backend gate.
+   *
+   * This package drives psmux / WezTerm. Other subagent packages (e.g.
+   * pi-herdr-agents) drive their own multiplexer and register their own tools.
+   * When our backend is not the one hosting this pi session we register nothing,
+   * so the model only ever sees the tool set that can actually work here instead
+   * of guessing between two frameworks and burning a call on an error result.
+   *
+   * Escape hatch: PI_ISUB_FORCE=1 registers the tools regardless.
+   */
+  const backend = getMuxBackend();
+  const muxActive = backend !== null || process.env.PI_ISUB_FORCE === "1";
+  const backendLabel = backend ?? "forced";
+  const registerTool: typeof pi.registerTool = (def) => {
+    if (muxActive) pi.registerTool(def as any);
+  };
+  const registerCommand: typeof pi.registerCommand = (name, def) => {
+    if (muxActive) pi.registerCommand(name, def);
+  };
+  /** Appended to tool descriptions so the active backend is unambiguous. */
+  const backendNote =
+    ` Runs in the ${backendLabel} multiplexer hosting this session — use these isub* tools here, ` +
+    `not the tools of another subagent package.`;
+
   // ── subagent tool ──
   if (shouldRegister("isub"))
-    pi.registerTool({
+    registerTool({
       name: "isub",
       label: "Subagent",
       description:
@@ -1101,13 +1126,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "IMPORTANT: This tool returns IMMEDIATELY — the sub-agent runs asynchronously in the background. " +
         "You will NOT have results when this tool returns. Results are delivered later via a steer message. " +
         "Do NOT fabricate, assume, or summarize results after calling this tool. " +
-        "Either wait for the steer message or move on to other work.",
+        "Either wait for the steer message or move on to other work." +
+        backendNote,
       promptSnippet:
         "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
         "IMPORTANT: This tool returns IMMEDIATELY — the sub-agent runs asynchronously in the background. " +
         "You will NOT have results when this tool returns. Results are delivered later via a steer message. " +
         "Do NOT fabricate, assume, or summarize results after calling this tool. " +
-        "Either wait for the steer message or move on to other work.",
+        "Either wait for the steer message or move on to other work." +
+        backendNote,
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1287,7 +1314,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // ── subagents_list tool ──
   if (shouldRegister("isub_list"))
-    pi.registerTool({
+    registerTool({
       name: "isub_list",
       label: "List Subagents",
       description:
@@ -1341,7 +1368,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // ── set_tab_title tool ──
   if (shouldRegister("isub_set_tab_title"))
-    pi.registerTool({
+    registerTool({
       name: "isub_set_tab_title",
       label: "Set Tab Title",
       description:
@@ -1378,7 +1405,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // ── subagent_interrupt tool ──
   if (shouldRegister("isub_interrupt"))
-    pi.registerTool({
+    registerTool({
       name: "isub_interrupt",
       label: "Interrupt Subagent",
       description:
@@ -1396,7 +1423,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // ── subagent_resume tool ──
   if (shouldRegister("isub_resume"))
-    pi.registerTool({
+    registerTool({
       name: "isub_resume",
       label: "Resume Subagent",
       description:
@@ -1629,7 +1656,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     });
 
   // /iterate command — fork the session into a subagent
-  pi.registerCommand("isub-iterate", {
+  registerCommand("isub-iterate", {
     description: "Fork session into a subagent for focused work (bugfixes, iteration)",
     handler: async (args, _ctx) => {
       const task = args?.trim() || "";
@@ -1641,7 +1668,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   });
 
   // /subagent command — spawn a subagent by name
-  pi.registerCommand("isub", {
+  registerCommand("isub", {
     description: "Spawn a subagent: /isub <agent> <task>",
     handler: async (args, ctx) => {
       const trimmed = (args ?? "").trim();
@@ -1772,7 +1799,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   });
 
   // /plan command — start the full planning workflow
-  pi.registerCommand("isub-plan", {
+  registerCommand("isub-plan", {
     description: "Start a planning session: /isub-plan <what to build>",
     handler: async (args, ctx) => {
       const task = (args ?? "").trim();

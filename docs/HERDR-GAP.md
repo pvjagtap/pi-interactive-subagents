@@ -88,3 +88,30 @@ Tools renamed to the `isub*` namespace so both packages can be installed at once
 (Pi fails an extension whose tool name is already registered). Commands renamed
 to `/isub`, `/isub-plan`, `/isub-iterate`; skill renamed to `isub-orchestrate`.
 Legacy names still resolve in `deny-tools` / `PI_DENY_TOOLS`.
+
+## 9. Backend disambiguation (done here, missing in herdr)
+
+Both packages historically detected their multiplexer **only at tool-execution
+time**:
+
+- ours: `getMuxBackend()` — `PSMUX_SESSION`/`TMUX` + psmux binary, or `WEZTERM_PANE` + wezterm binary
+- herdr: `isHerdrAvailable()` — `HERDR_ENV === "1"` + `herdr` binary
+
+herdr registers its tools unconditionally and only returns
+`"herdr is not available. <hint>"` when called, so with both packages installed
+the model sees 11 spawn-ish tools and can waste a call on the wrong framework.
+
+This package now gates **registration** on backend detection: outside psmux /
+WezTerm no `isub*` tool or `/isub*` command is registered at all (override:
+`PI_ISUB_FORCE=1`). Tool descriptions also name the active backend. Verified:
+
+```
+$ pi -p "list tools starting with isub or subagent"   # plain terminal
+subagent, subagent_send, subagent_stop, subagent_interrupt, subagents_list, subagent_resume
+
+$ PI_ISUB_FORCE=1 pi -p "..."
+isub, isub_list, isub_set_tab_title, isub_interrupt, isub_resume
+```
+
+Remaining exposure is herdr's side; an upstream PR moving its registrations
+behind `isTerminalAvailable()` would make the split symmetric.

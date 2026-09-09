@@ -107,6 +107,25 @@ already taken).
 The old names are still accepted in `deny-tools:` frontmatter and `PI_DENY_TOOLS`
 for backward compatibility.
 
+### Backend gating (coexisting with other subagent packages)
+
+This package only registers its tools and commands when the pi session is
+actually running inside a backend it drives:
+
+| Backend | Detected via                                    |
+| ------- | ----------------------------------------------- |
+| psmux   | `PSMUX_SESSION` (or `TMUX` on Windows) + binary |
+| WezTerm | `WEZTERM_PANE` + `wezterm` binary               |
+
+If neither is present, `isub*` tools and `/isub*` commands are **not registered
+at all** — so the model never sees a tool it cannot use, and there is no
+ambiguity when another subagent framework (e.g. `pi-herdr-agents`, which drives
+`herdr` and detects `HERDR_ENV=1`) is installed side by side. Inside psmux or
+WezTerm you get the `isub*` tools; inside herdr you get theirs.
+
+Override with `PI_ISUB_FORCE=1` to register regardless of the detected terminal,
+and `PI_MUX_BACKEND=psmux|wezterm` to pick a backend when both are available.
+
 ---
 
 ## Async Subagent Flow
