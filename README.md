@@ -6,7 +6,7 @@ https://github.com/user-attachments/assets/30adb156-cfb4-4c47-84ca-dd4aa80cba9f
 
 ## How It Works
 
-Call `subagent()` and it **returns immediately**. The sub-agent runs in its own terminal pane. A live widget above the input shows all running agents with elapsed time and progress. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the agent can process it.
+Call `isub()` and it **returns immediately**. The sub-agent runs in its own terminal pane. A live widget above the input shows all running agents with elapsed time and progress. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the agent can process it.
 
 ```
 ╭─ Subagents ──────────────────────── 2 running ─╮
@@ -15,11 +15,11 @@ Call `subagent()` and it **returns immediately**. The sub-agent runs in its own 
 ╰─────────────────────────────────────────────────╯
 ```
 
-For parallel execution, just call `subagent` multiple times — they all run concurrently:
+For parallel execution, just call `isub` multiple times — they all run concurrently:
 
 ```typescript
-subagent({ name: "Scout: Auth", agent: "scout", task: "Analyze auth module" });
-subagent({ name: "Scout: DB", agent: "scout", task: "Map database schema" });
+isub({ name: "Scout: Auth", agent: "scout", task: "Analyze auth module" });
+isub({ name: "Scout: DB", agent: "scout", task: "Map database schema" });
 // Both return immediately, results steer back independently
 ```
 
@@ -45,16 +45,16 @@ psmux new -s pi -- pi
 
 | Tool              | Description                                                                     |
 | ----------------- | ------------------------------------------------------------------------------- |
-| `subagent`        | Spawn a sub-agent in a dedicated multiplexer pane (async — returns immediately) |
-| `subagents_list`  | List available agent definitions                                                |
-| `set_tab_title`   | Update tab/window title to show progress                                        |
-| `subagent_resume` | Resume a previous sub-agent session (async)                                     |
+| `isub`        | Spawn a sub-agent in a dedicated multiplexer pane (async — returns immediately) |
+| `isub_list`  | List available agent definitions                                                |
+| `isub_set_tab_title`   | Update tab/window title to show progress                                        |
+| `isub_resume` | Resume a previous sub-agent session (async)                                     |
 
 | Command                    | Description                          |
 | -------------------------- | ------------------------------------ |
-| `/plan`                    | Start a full planning workflow       |
-| `/iterate`                 | Fork into a subagent for quick fixes |
-| `/subagent <agent> <task>` | Spawn a named agent directly         |
+| `/isub-plan`                    | Start a full planning workflow       |
+| `/isub-iterate`                 | Fork into a subagent for quick fixes |
+| `/isub <agent> <task>` | Spawn a named agent directly         |
 
 **Session Artifacts** — 2 tools for session-scoped file storage:
 
@@ -72,15 +72,47 @@ psmux new -s pi -- pi
 | **worker**        | Sonnet                 | Implements tasks from todos — writes code, runs tests, makes polished commits            |
 | **reviewer**      | Opus (medium thinking) | Reviews code for bugs, security issues, correctness                                      |
 | **visual-tester** | Sonnet                 | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
+| **poteto**        | inherits               | Deliberate general-purpose orchestrator — delegates recon/impl/review, integrates results |
+| **adversarial-reviewer** | high thinking   | Multi-wave adversarial review with fresh, cross-family reviewers                          |
+| **spec**          | see `agents/spec.md`   | Turns a rough idea into a written specification                                          |
+| **claude-code**   | Claude Code CLI        | Delegates to the local `claude` CLI                                                      |
 
 Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Override any bundled agent by placing your own version in the higher-priority location.
+
+### Bundled Skills
+
+| Skill                | Purpose                                                                              |
+| -------------------- | ------------------------------------------------------------------------------------ |
+| `isub-orchestrate`   | Bounded multi-agent review: evidence pinning, fan-out with fresh reviewers, synthesis |
+
+---
+
+## Tool Namespace
+
+All tools are namespaced under `isub*` so this package can be installed next to
+other subagent packages (Pi refuses to load an extension whose tool names are
+already taken).
+
+| Old name             | Current name           |
+| -------------------- | ---------------------- |
+| `subagent`           | `isub`                 |
+| `subagents_list`     | `isub_list`            |
+| `subagent_interrupt` | `isub_interrupt`       |
+| `subagent_resume`    | `isub_resume`          |
+| `set_tab_title`      | `isub_set_tab_title`   |
+| `/subagent`          | `/isub`                |
+| `/plan`              | `/isub-plan`           |
+| `/iterate`           | `/isub-iterate`        |
+
+The old names are still accepted in `deny-tools:` frontmatter and `PI_DENY_TOOLS`
+for backward compatibility.
 
 ---
 
 ## Async Subagent Flow
 
 ```
-1. Agent calls subagent()         → returns immediately ("started")
+1. Agent calls isub()         → returns immediately ("started")
 2. Sub-agent runs in mux pane     → widget shows live progress
 3. User keeps chatting             → main session fully interactive
 4. Sub-agent finishes              → result steered back as interrupt
@@ -105,13 +137,13 @@ Completion messages render with a colored background and are expandable with `Ct
 
 ```typescript
 // Named agent with defaults from agent definition
-subagent({ name: "Scout", agent: "scout", task: "Analyze the codebase..." });
+isub({ name: "Scout", agent: "scout", task: "Analyze the codebase..." });
 
 // Fork — sub-agent gets full conversation context
-subagent({ name: "Iterate", fork: true, task: "Fix the bug where..." });
+isub({ name: "Iterate", fork: true, task: "Fix the bug where..." });
 
 // Override agent defaults
-subagent({
+isub({
   name: "Worker",
   agent: "worker",
   model: "anthropic/claude-haiku-4-5",
@@ -119,7 +151,7 @@ subagent({
 });
 
 // Custom working directory
-subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer", task: "..." });
+isub({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer", task: "..." });
 ```
 
 ### Parameters
@@ -140,7 +172,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 
 ## caller_ping — Child-to-Parent Help Request
 
-The `caller_ping` tool lets a subagent request help from its parent agent. When called, the child session **exits** and the parent receives a notification with the help message. The parent can then **resume** the child session with a response using `subagent_resume`.
+The `caller_ping` tool lets a subagent request help from its parent agent. When called, the child session **exits** and the parent receives a notification with the help message. The parent can then **resume** the child session with a response using `isub_resume`.
 
 **Parameters:**
 - `message` (required): What you need help with
@@ -149,7 +181,7 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`
 2. Child session exits (like `subagent_done`)
 3. Parent receives a steer notification: *"Sub-agent Worker needs help: Not sure which schema to use"*
-4. Parent resumes the child session via `subagent_resume` with the response
+4. Parent resumes the child session via `isub_resume` with the response
 5. Child picks up where it left off with the parent's guidance
 
 **Example:**
@@ -166,9 +198,9 @@ await caller_ping({
 
 ---
 
-## The `/plan` Workflow
+## The `/isub-plan` Workflow
 
-The `/plan` command orchestrates a full planning-to-implementation pipeline.
+The `/isub-plan` command orchestrates a full planning-to-implementation pipeline.
 
 ```
 /plan Add a dark mode toggle to the settings page
@@ -191,7 +223,7 @@ Tab/window titles update to show current phase:
 
 ---
 
-## The `/iterate` Workflow
+## The `/isub-iterate` Workflow
 
 For quick, focused work without polluting the main session's context.
 
@@ -227,7 +259,7 @@ You are a specialized agent that does X...
 | Field         | Type    | Description                                                                                                                                                                                                                                                                 |
 | ------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `name`        | string  | Agent name (used in `agent: "my-agent"`)                                                                                                                                                                                                                                    |
-| `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
+| `description` | string  | Shown in `isub_list` output                                                                                                                                                                                                                                            |
 | `model`       | string  | Default model (e.g. `anthropic/claude-sonnet-4-6`)                                                                                                                                                                                                                          |
 | `thinking`    | string  | Thinking level: `minimal`, `medium`, `high`                                                                                                                                                                                                                                 |
 | `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
@@ -269,7 +301,7 @@ By default, every sub-agent can spawn further sub-agents. Control this with fron
 
 ### `spawning: false`
 
-Denies all spawning tools (`subagent`, `subagents_list`, `subagent_resume`):
+Denies all spawning tools (`isub`, `isub_list`, `isub_resume`):
 
 ```yaml
 ---
@@ -285,7 +317,7 @@ Fine-grained control over individual extension tools:
 ```yaml
 ---
 name: focused-agent
-deny-tools: subagent, set_tab_title
+deny-tools: isub, isub_set_tab_title
 ---
 ```
 
@@ -318,8 +350,8 @@ project/
 ```
 
 ```typescript
-subagent({ name: "Game Designer", cwd: "agents/game-designer", task: "Design the combat system" });
-subagent({ name: "SRE", cwd: "agents/sre", task: "Review deployment pipeline" });
+isub({ name: "Game Designer", cwd: "agents/game-designer", task: "Design the combat system" });
+isub({ name: "SRE", cwd: "agents/sre", task: "Review deployment pipeline" });
 ```
 
 Set a default `cwd` in agent frontmatter:
@@ -342,7 +374,7 @@ Every sub-agent session displays a compact tools widget showing available and de
 [scout] — 12 tools · 4 denied  (Ctrl+J)              ← collapsed
 [scout] — 12 available  (Ctrl+J to collapse)          ← expanded
   read, bash, edit, write, todo, ...
-  denied: subagent, subagents_list, ...
+  denied: isub, isub_list, ...
 ```
 
 ---

@@ -1,7 +1,7 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { keyHint } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
-import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { dirname, isAbsolute, join } from "node:path";
 import {
   readdirSync,
@@ -157,11 +157,30 @@ interface ListedAgentDefinition extends AgentDefinition {
 
 /** Tools that are gated by `spawning: false` */
 const SPAWNING_TOOLS = new Set([
-  "subagent",
-  "subagent_interrupt",
-  "subagents_list",
-  "subagent_resume",
+  "isub",
+  "isub_interrupt",
+  "isub_list",
+  "isub_resume",
 ]);
+
+/**
+ * Legacy tool names accepted in `deny-tools` frontmatter and PI_DENY_TOOLS.
+ * The tools were renamed to the `isub*` namespace so this package can be
+ * installed alongside other subagent packages (tool names must be globally
+ * unique or the extension fails to load).
+ */
+const LEGACY_TOOL_ALIASES: Record<string, string> = {
+  subagent: "isub",
+  subagent_interrupt: "isub_interrupt",
+  subagents_list: "isub_list",
+  subagent_resume: "isub_resume",
+  set_tab_title: "isub_set_tab_title",
+};
+
+/** Map a possibly-legacy tool name to its current name. */
+function canonicalToolName(name: string): string {
+  return LEGACY_TOOL_ALIASES[name] ?? name;
+}
 
 /**
  * Resolve the effective set of denied tool names from agent defaults.
@@ -183,7 +202,7 @@ function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean)) {
-      denied.add(t);
+      denied.add(canonicalToolName(t));
     }
   }
 
@@ -744,7 +763,7 @@ function startWidgetRefresh() {
  */
 async function launchSubagent(
   params: typeof SubagentParams.static,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  ctx: { sessionManager: { getSessionFile(): string | null | undefined; getSessionId(): string; getSessionDir(): string }; cwd: string },
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
@@ -797,7 +816,7 @@ async function launchSubagent(
     : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
   const denySet = resolveDenyTools(agentDefs);
   const agentType = params.agent ?? params.name;
-  const tabTitleInstruction = denySet.has("set_tab_title")
+  const tabTitleInstruction = denySet.has("isub_set_tab_title")
     ? ""
     : `As your FIRST action, set the tab title using set_tab_title. ` +
       `The title MUST start with [${agentType}] followed by a short description of your current task. ` +
@@ -1066,15 +1085,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     (process.env.PI_DENY_TOOLS ?? "")
       .split(",")
       .map((s) => s.trim())
-      .filter(Boolean),
+      .filter(Boolean)
+      .map(canonicalToolName),
   );
 
   const shouldRegister = (name: string) => !deniedTools.has(name);
 
   // ── subagent tool ──
-  if (shouldRegister("subagent"))
+  if (shouldRegister("isub"))
     pi.registerTool({
-      name: "subagent",
+      name: "isub",
       label: "Subagent",
       description:
         "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
@@ -1259,15 +1279,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Fallback (shouldn't happen)
-        const text = typeof result.content?.[0]?.text === "string" ? result.content[0].text : "";
+        const first = result.content?.[0] as { type?: string; text?: string } | undefined;
+        const text = typeof first?.text === "string" ? first.text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
     });
 
   // ── subagents_list tool ──
-  if (shouldRegister("subagents_list"))
+  if (shouldRegister("isub_list"))
     pi.registerTool({
-      name: "subagents_list",
+      name: "isub_list",
       label: "List Subagents",
       description:
         "List all available subagent definitions. " +
@@ -1319,9 +1340,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     });
 
   // ── set_tab_title tool ──
-  if (shouldRegister("set_tab_title"))
+  if (shouldRegister("isub_set_tab_title"))
     pi.registerTool({
-      name: "set_tab_title",
+      name: "isub_set_tab_title",
       label: "Set Tab Title",
       description:
         "Update the current tab/window and workspace/session title. Use to show progress during multi-phase workflows " +
@@ -1356,9 +1377,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     });
 
   // ── subagent_interrupt tool ──
-  if (shouldRegister("subagent_interrupt"))
+  if (shouldRegister("isub_interrupt"))
     pi.registerTool({
-      name: "subagent_interrupt",
+      name: "isub_interrupt",
       label: "Interrupt Subagent",
       description:
         "Send an Escape keypress to a running subagent to interrupt its current turn. " +
@@ -1374,9 +1395,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     });
 
   // ── subagent_resume tool ──
-  if (shouldRegister("subagent_resume"))
+  if (shouldRegister("isub_resume"))
     pi.registerTool({
-      name: "subagent_resume",
+      name: "isub_resume",
       label: "Resume Subagent",
       description:
         "Resume a previous sub-agent session in a new multiplexer pane. " +
@@ -1423,7 +1444,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Fallback
-        const text = typeof result.content?.[0]?.text === "string" ? result.content[0].text : "";
+        const firstContent = result.content?.[0] as { type?: string; text?: string } | undefined;
+        const text = typeof firstContent?.text === "string" ? firstContent.text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
 
@@ -1607,24 +1629,24 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     });
 
   // /iterate command — fork the session into a subagent
-  pi.registerCommand("iterate", {
+  pi.registerCommand("isub-iterate", {
     description: "Fork session into a subagent for focused work (bugfixes, iteration)",
     handler: async (args, _ctx) => {
       const task = args?.trim() || "";
       const toolCall = task
-        ? `Use subagent to fork a session. fork: true, name: "Iterate", task: ${JSON.stringify(task)}`
-        : `Use subagent to fork a session. fork: true, name: "Iterate", task: "The user wants to do some hands-on work. Help them with whatever they need."`;
+        ? `Use isub to fork a session. fork: true, name: "Iterate", task: ${JSON.stringify(task)}`
+        : `Use isub to fork a session. fork: true, name: "Iterate", task: "The user wants to do some hands-on work. Help them with whatever they need."`;
       pi.sendUserMessage(toolCall);
     },
   });
 
   // /subagent command — spawn a subagent by name
-  pi.registerCommand("subagent", {
-    description: "Spawn a subagent: /subagent <agent> <task>",
+  pi.registerCommand("isub", {
+    description: "Spawn a subagent: /isub <agent> <task>",
     handler: async (args, ctx) => {
       const trimmed = (args ?? "").trim();
       if (!trimmed) {
-        ctx.ui.notify("Usage: /subagent <agent> [task]", "warning");
+        ctx.ui.notify("Usage: /isub <agent> [task]", "warning");
         return;
       }
 
@@ -1643,7 +1665,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       const taskText = task || `You are the ${agentName} agent. Wait for instructions.`;
       const displayName = agentName[0].toUpperCase() + agentName.slice(1);
-      const toolCall = `Use subagent with agent: "${agentName}", name: "${displayName}", task: ${JSON.stringify(taskText)}`;
+      const toolCall = `Use isub with agent: "${agentName}", name: "${displayName}", task: ${JSON.stringify(taskText)}`;
       pi.sendUserMessage(toolCall);
     },
   });
@@ -1750,12 +1772,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   });
 
   // /plan command — start the full planning workflow
-  pi.registerCommand("plan", {
-    description: "Start a planning session: /plan <what to build>",
+  pi.registerCommand("isub-plan", {
+    description: "Start a planning session: /isub-plan <what to build>",
     handler: async (args, ctx) => {
       const task = (args ?? "").trim();
       if (!task) {
-        ctx.ui.notify("Usage: /plan <what to build>", "warning");
+        ctx.ui.notify("Usage: /isub-plan <what to build>", "warning");
         return;
       }
 

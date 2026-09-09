@@ -17,7 +17,7 @@ A planning workflow that separates WHAT (spec) from HOW (plan). First a spec age
 
 ## Tab Titles
 
-Use `set_tab_title` to keep the user informed of progress in the multiplexer UI. Update the title at every phase transition.
+Use `isub_set_tab_title` to keep the user informed of progress in the multiplexer UI. Update the title at every phase transition.
 
 | Phase         | Title example                                                  |
 | ------------- | -------------------------------------------------------------- |
@@ -81,7 +81,7 @@ Spend ~30 seconds. You're looking for: tech stack, project shape, and the area r
 **Always spawn a scout before spec/planner.** The scout's context feeds into both — it helps the spec agent ask better questions and helps the planner make better design decisions.
 
 ```typescript
-subagent({
+isub({
   name: "🔍 Scout",
   agent: "scout",
   task: "Analyze the codebase for [user's request area]. Map file structure, key modules, patterns, conventions, and existing code related to [feature area]. Focus on what a spec agent and planner would need to understand.",
@@ -97,7 +97,7 @@ subagent({
 Spawn the interactive spec agent with the scout's context. The `spec` agent clarifies intent, requirements, effort level, and success criteria (ISC) with the user.
 
 ```typescript
-subagent({
+isub({
   name: "📝 Spec",
   agent: "spec",
   interactive: true,
@@ -120,7 +120,7 @@ Read the spec artifact, then spawn the planner. Pass both the spec AND the scout
 // Read the spec first
 read_artifact({ name: "specs/YYYY-MM-DD-<name>.md" });
 
-subagent({
+isub({
   name: "💬 Planner",
   agent: "planner",
   interactive: true,
@@ -140,7 +140,7 @@ When done, the user presses Ctrl+D and the plan + todos are returned.
 If the spec or planner significantly changed scope (e.g. new subsystems, different approach than expected, areas the original scout didn't cover), spawn another scout targeting the new areas:
 
 ```typescript
-subagent({
+isub({
   name: "🔍 Scout (updated scope)",
   agent: "scout",
   task: "The plan changed scope. Gather context for [new areas]. Read the plan at [plan path]. Focus on [specific files/modules the planner identified that weren't in the original scout].",
@@ -171,14 +171,14 @@ Spawn workers sequentially. Each worker gets the plan path and scout context:
 
 ```typescript
 // Workers execute todos sequentially — one at a time
-subagent({
+isub({
   name: "🔨 Worker 1/N",
   agent: "worker",
   task: "Implement TODO-xxxx. Mark the todo as done. Plan: [plan path]\n\nScout context: [paste scout summary from Phase 2, plus any re-scout from Phase 4]",
 });
 
 // Check result, then next todo
-subagent({
+isub({
   name: "🔨 Worker 2/N",
   agent: "worker",
   task: "Implement TODO-yyyy. Mark the todo as done. Plan: [plan path]\n\nScout context: [paste scout summary]",
@@ -194,7 +194,7 @@ subagent({
 After all todos are complete:
 
 ```typescript
-subagent({
+isub({
   name: "Reviewer",
   agent: "reviewer",
   interactive: false,

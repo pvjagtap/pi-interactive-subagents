@@ -110,7 +110,7 @@ cat package.json 2>/dev/null | head -30
 **If deeper context is needed** (unfamiliar codebase, complex domain), spawn a scout or researcher:
 
 ```typescript
-subagent({
+isub({
   name: "🔍 Scout",
   agent: "scout",
   task: "Analyze the codebase. Map file structure, key modules, patterns, and conventions. Focus on [relevant area].",

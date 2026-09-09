@@ -72,11 +72,11 @@ for (const backend of backends) {
       await sleep(1000);
 
       const task = [
-        `Call the subagent tool with these EXACT parameters:`,
+        `Call the isub tool with these EXACT parameters:`,
         `  name: "Echo-${id}"`,
         `  agent: "test-echo"`,
         `  task: "Run this bash command: echo 'PASS_${id}' > '${markerFile}'"`,
-        `Do not do anything else. Just call the subagent tool once.`,
+        `Do not do anything else. Just call the isub tool once.`,
         `After you receive the subagent result, say INTEGRATION_COMPLETE.`,
       ].join("\n");
 
@@ -124,7 +124,7 @@ for (const backend of backends) {
       await sleep(1000);
 
       const task = [
-        `You must call the subagent tool TWICE. Make both calls before waiting for results.`,
+        `You must call the isub tool TWICE. Make both calls before waiting for results.`,
         ``,
         `First call:`,
         `  name: "ParaA-${id}"`,
@@ -136,7 +136,7 @@ for (const backend of backends) {
         `  agent: "test-echo"`,
         `  task: "Run: echo 'DONE_B_${id}' > '${fileB}'"`,
         ``,
-        `Call both subagent tools NOW, do not wait between them.`,
+        `Call both isub tools NOW, do not wait between them.`,
       ].join("\n");
 
       startPi(surface, env.dir, task);
@@ -162,7 +162,7 @@ for (const backend of backends) {
       await sleep(1000);
 
       const task = [
-        `Call the subagent tool with these EXACT parameters:`,
+        `Call the isub tool with these EXACT parameters:`,
         `  name: "Fork-${id}"`,
         `  fork: true`,
         `  task: "Run this bash command: echo 'FORK_OK_${id}' > '${markerFile}'"`,
@@ -210,11 +210,11 @@ for (const backend of backends) {
       await sleep(1000);
 
       const task = [
-        `Call the subagent tool with these EXACT parameters:`,
+        `Call the isub tool with these EXACT parameters:`,
         `  name: "Ping-${id}"`,
         `  agent: "test-ping"`,
         `  task: "PING_TEST_${id}"`,
-        `Just call the subagent tool once. Do not do anything else before calling it.`,
+        `Just call the isub tool once. Do not do anything else before calling it.`,
       ].join("\n");
 
       startPi(surface, env.dir, task);
@@ -247,7 +247,7 @@ for (const backend of backends) {
       // then spawn one to prove it works end-to-end.
       const task = [
         `First, call the subagents_list tool to see available agents.`,
-        `Then call the subagent tool:`,
+        `Then call the isub tool:`,
         `  name: "Disco-${id}"`,
         `  agent: "test-echo"`,
         `  task: "Run: echo 'DISCO_${id}' > '${markerFile}'"`,
@@ -272,7 +272,7 @@ for (const backend of backends) {
       await sleep(1000);
 
       const task = [
-        `Call the subagent tool with these parameters:`,
+        `Call the isub tool with these parameters:`,
         `  name: "SysP-${id}"`,
         `  agent: "test-echo"`,
         `  systemPrompt: "Always start your response with CUSTOM_PROMPT_ACTIVE."`,
