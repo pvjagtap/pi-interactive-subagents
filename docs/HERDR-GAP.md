@@ -102,16 +102,11 @@ herdr registers its tools unconditionally and only returns
 the model sees 11 spawn-ish tools and can waste a call on the wrong framework.
 
 This package now gates **registration** on backend detection: outside psmux /
-WezTerm no `isub*` tool or `/isub*` command is registered at all (override:
-`PI_ISUB_FORCE=1`). Tool descriptions also name the active backend. Verified:
+WezTerm no `isub*` tool or `/isub*` command is registered at all. Registration
+uses the same predicate the operations enforce, so no configuration can expose a
+surface the multiplexer cannot serve; tests use an explicit
+`subagentsExtension(pi, { registerWithoutMux: true })` seam. Tool descriptions
+also name the active backend.
 
-```
-$ pi -p "list tools starting with isub or subagent"   # plain terminal
-subagent, subagent_send, subagent_stop, subagent_interrupt, subagents_list, subagent_resume
-
-$ PI_ISUB_FORCE=1 pi -p "..."
-isub, isub_list, isub_set_tab_title, isub_interrupt, isub_resume
-```
-
-Remaining exposure is herdr's side; an upstream PR moving its registrations
-behind `isTerminalAvailable()` would make the split symmetric.
+Upstream PR giuseppecrj/pi-herdr-agents#44 applies the same gate to herdr, which
+makes the split symmetric.

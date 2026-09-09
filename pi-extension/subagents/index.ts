@@ -1062,7 +1062,25 @@ async function watchSubagent(
   }
 }
 
-export default function subagentsExtension(pi: ExtensionAPI) {
+/**
+ * Options accepted by the extension factory.
+ *
+ * Pi invokes the factory with the extension API alone, so these exist purely as
+ * a test seam.
+ */
+export interface SubagentsExtensionOptions {
+  /**
+   * Register the tools and commands even when no supported multiplexer is
+   * detected. Guarded operations still require a real psmux/WezTerm session at
+   * execution time.
+   */
+  registerWithoutMux?: boolean;
+}
+
+export default function subagentsExtension(
+  pi: ExtensionAPI,
+  options: SubagentsExtensionOptions = {},
+) {
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
@@ -1100,11 +1118,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
    * so the model only ever sees the tool set that can actually work here instead
    * of guessing between two frameworks and burning a call on an error result.
    *
-   * Escape hatch: PI_ISUB_FORCE=1 registers the tools regardless.
+   * Registration uses the same predicate the operations enforce, so no
+   * configuration can expose a surface the multiplexer cannot serve.
    */
   const backend = getMuxBackend();
-  const muxActive = backend !== null || process.env.PI_ISUB_FORCE === "1";
-  const backendLabel = backend ?? "forced";
+  const muxActive = backend !== null || options.registerWithoutMux === true;
+  const backendLabel = backend ?? "unavailable";
   const registerTool: typeof pi.registerTool = (def) => {
     if (muxActive) pi.registerTool(def as any);
   };

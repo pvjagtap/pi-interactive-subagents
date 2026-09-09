@@ -123,8 +123,9 @@ ambiguity when another subagent framework (e.g. `pi-herdr-agents`, which drives
 `herdr` and detects `HERDR_ENV=1`) is installed side by side. Inside psmux or
 WezTerm you get the `isub*` tools; inside herdr you get theirs.
 
-Override with `PI_ISUB_FORCE=1` to register regardless of the detected terminal,
-and `PI_MUX_BACKEND=psmux|wezterm` to pick a backend when both are available.
+Registration uses the same detection the operations enforce, so no configuration
+can expose a surface the multiplexer cannot serve. Use
+`PI_MUX_BACKEND=psmux|wezterm` to pick a backend when both are available.
 
 ---
 
