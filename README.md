@@ -1,6 +1,6 @@
 # pi-interactive-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono) — spawn, orchestrate, and manage sub-agent sessions in psmux panes on **Windows**. **Fully non-blocking** — the main agent keeps working while subagents run in the background.
+Async subagents for [pi](https://github.com/badlogic/pi-mono) — spawn, orchestrate, and manage sub-agent sessions in psmux, WezTerm or **Warp** panes on **Linux** and **Windows**. **Fully non-blocking** — the main agent keeps working while subagents run in the background.
 
 https://github.com/user-attachments/assets/30adb156-cfb4-4c47-84ca-dd4aa80cba9f
 
@@ -29,13 +29,44 @@ isub({ name: "Scout: DB", agent: "scout", task: "Map database schema" });
 pi install git:github.com/HazAT/pi-interactive-subagents
 ```
 
-Requires [psmux](https://github.com/nicobailon/psmux) — a tmux-compatible terminal multiplexer written in Rust that works natively on **Windows**.
+Requires one supported surface host: [psmux](https://github.com/nicobailon/psmux) (a
+tmux-compatible multiplexer written in Rust that works natively on **Windows**),
+[WezTerm](https://wezfurlong.org/wezterm/), or [Warp](https://www.warp.dev).
 
 Start pi inside psmux:
 
 ```bash
 psmux new -s pi -- pi
 ```
+
+### Warp
+
+Warp is supported on **Linux and Windows**. It ships no multiplexer CLI, so a
+guarded shell-profile hook hands each newly opened tab to the pane bootstrap —
+that is the only setup step:
+
+```bash
+node scripts/install-warp-hook.mjs --install     # add the hook
+node scripts/install-warp-hook.mjs --status      # check what is installed
+node scripts/install-warp-hook.mjs --uninstall   # fully reversible
+```
+
+Then open a **new** Warp tab. Until the hook is present, Warp is not advertised as
+a backend and the setup hint explains why. Sub-agents finish by calling the
+`subagent_done` tool — it writes an exit sidecar file that the parent polls — so
+nothing depends on screen scraping and no one types `/exit`.
+
+| Variable | Purpose |
+| -------- | ------- |
+| `PI_MUX_BACKEND=warp` | force the Warp backend |
+| `PI_WARP_SUBMIT_KEY` | key used to submit a line (`cr` default; LF does not submit in raw-mode TUIs) |
+| `PI_WARP_SCREEN=raw` | return the stripped transcript instead of the rendered screen |
+| `PI_WARP_NO_LAUNCH=1` | prepare surfaces without opening any UI (tests/dry-runs) |
+
+On Windows, Git Bash / MSYS2 / WSL panes get full parity; PowerShell panes run in
+a reduced "direct mode" (launch and completion work, live injection does not).
+See [docs/warp-backend.md](docs/warp-backend.md) for the full guide and platform
+matrix, and [ADR-0011](docs/adr/0011-warp-terminal-class-1-backend.md) for the design.
 
 ## What's Included
 
@@ -116,16 +147,18 @@ actually running inside a backend it drives:
 | ------- | ----------------------------------------------- |
 | psmux   | `PSMUX_SESSION` (or `TMUX` on Windows) + binary |
 | WezTerm | `WEZTERM_PANE` + `wezterm` binary               |
+| Warp    | `TERM_PROGRAM=WarpTerminal` + installed pane hook |
 
 If neither is present, `isub*` tools and `/isub*` commands are **not registered
 at all** — so the model never sees a tool it cannot use, and there is no
 ambiguity when another subagent framework (e.g. `pi-herdr-agents`, which drives
-`herdr` and detects `HERDR_ENV=1`) is installed side by side. Inside psmux or
-WezTerm you get the `isub*` tools; inside herdr you get theirs.
+`herdr` and detects `HERDR_ENV=1`) is installed side by side. Inside psmux,
+WezTerm or Warp you get the `isub*` tools; inside herdr you get theirs.
 
 Registration uses the same detection the operations enforce, so no configuration
 can expose a surface the multiplexer cannot serve. Use
-`PI_MUX_BACKEND=psmux|wezterm` to pick a backend when both are available.
+`PI_MUX_BACKEND=psmux|wezterm|warp` to pick a backend when several are available.
+Warp is tried last, so a multiplexer running *inside* a Warp window still wins.
 
 ---
 
@@ -407,6 +440,7 @@ Every sub-agent session displays a compact tools widget showing available and de
   - [tmux](https://github.com/tmux/tmux)
   - [zellij](https://zellij.dev)
   - [WezTerm](https://wezfurlong.org/wezterm/)
+  - [Warp](https://www.warp.dev) (run `node scripts/install-warp-hook.mjs --install` once)
 
 ```bash
 cmux pi
@@ -416,6 +450,8 @@ tmux new -A -s pi 'pi'
 zellij --session pi   # then run: pi
 # or
 # just run pi inside WezTerm
+# or
+# just run pi inside Warp (after installing the pane hook)
 ```
 
 Optional backend override:

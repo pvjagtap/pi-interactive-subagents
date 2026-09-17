@@ -1,6 +1,7 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -17,6 +18,26 @@ import {
 } from "../pi-extension/subagents/session.ts";
 
 import { shellEscape, isPsmuxAvailable } from "../pi-extension/subagents/cmux.ts";
+import { charWidth, renderScreen, renderTail } from "../pi-extension/subagents/warp-screen.ts";
+import {
+  alignUtf8,
+  WARP_SURFACE_PROTOCOL,
+  createWarpSurface,
+  isInsideWarp,
+  isWarpHookInstalled,
+  isWarpRuntimeAvailable,
+  listWarpSurfaces,
+  readSpec,
+  readStatus,
+  stripAnsi,
+  surfaceDir,
+  tomlEscape,
+  warpDiagnostics,
+  warpReadScreen,
+  warpSendCommand,
+  renderSurfaceEnv,
+  shQuote,
+} from "../pi-extension/subagents/warp.ts";
 import {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
@@ -420,5 +441,425 @@ describe("cmux.ts", () => {
       const result = isPsmuxAvailable();
       assert.equal(typeof result, "boolean");
     });
+  });
+});
+
+// ── Warp backend ─────────────────────────────────────────────────────────────
+
+describe("warp.ts", () => {
+  let warpDir: string;
+  let prevState: string | undefined;
+  let prevNoLaunch: string | undefined;
+
+  before(() => {
+    warpDir = createTestDir();
+    prevState = process.env.PI_WARP_STATE_DIR;
+    prevNoLaunch = process.env.PI_WARP_NO_LAUNCH;
+    process.env.PI_WARP_STATE_DIR = warpDir;
+    process.env.PI_WARP_NO_LAUNCH = "1";
+  });
+
+  after(() => {
+    if (prevState === undefined) delete process.env.PI_WARP_STATE_DIR;
+    else process.env.PI_WARP_STATE_DIR = prevState;
+    if (prevNoLaunch === undefined) delete process.env.PI_WARP_NO_LAUNCH;
+    else process.env.PI_WARP_NO_LAUNCH = prevNoLaunch;
+    rmSync(warpDir, { recursive: true, force: true });
+  });
+
+  describe("stripAnsi", () => {
+    it("removes SGR sequences", () => {
+      assert.equal(stripAnsi("\u001b[31mred\u001b[0m"), "red");
+    });
+
+    it("removes OSC title sequences Warp emits", () => {
+      assert.equal(stripAnsi("\u001b]0;user@host: /tmp\u0007prompt$ "), "prompt$ ");
+    });
+
+    it("normalises bare carriage returns to newlines", () => {
+      assert.equal(stripAnsi("a\rb"), "a\nb");
+    });
+
+    it("leaves plain text untouched", () => {
+      assert.equal(stripAnsi("__SUBAGENT_DONE_0__"), "__SUBAGENT_DONE_0__");
+    });
+  });
+
+  describe("tomlEscape", () => {
+    it("escapes backslashes and quotes for Windows paths", () => {
+      assert.equal(tomlEscape("C:\\Users\\a b"), "C:\\\\Users\\\\a b");
+      assert.equal(tomlEscape('say "hi"'), 'say \\"hi\\"');
+    });
+  });
+
+  describe("createWarpSurface", () => {
+    it("writes a complete surface handshake and mints an addressable id", () => {
+      const id = createWarpSurface("api-worker", { cwd: warpDir, command: "echo hi" });
+      assert.ok(id.length > 3);
+
+      const dir = surfaceDir(id);
+      assert.ok(existsSync(join(dir, ".pi-warp-surface")), "marker file exists");
+
+      const spec = readSpec(id);
+      assert.equal(spec.protocol, WARP_SURFACE_PROTOCOL);
+      assert.equal(spec.id, id);
+      assert.equal(spec.name, "api-worker");
+      assert.equal(spec.cwd, warpDir);
+      assert.equal(spec.command, "echo hi");
+      assert.equal(spec.env.PI_SUBAGENT_SURFACE, id);
+      assert.equal(spec.env.PI_SUBAGENT_SURFACE_DIR, dir);
+      assert.ok(spec.log.endsWith("out.log"));
+    });
+
+    it("reports a starting status before the pane bootstraps", () => {
+      const id = createWarpSurface("scout", { cwd: warpDir });
+      assert.equal(readStatus(id)?.state, "starting");
+    });
+
+    it("gives each surface an isolated directory", () => {
+      const a = createWarpSurface("a", { cwd: warpDir });
+      const b = createWarpSurface("b", { cwd: warpDir });
+      assert.notEqual(surfaceDir(a), surfaceDir(b));
+      assert.equal(listWarpSurfaces().length >= 2, true);
+    });
+  });
+
+  describe("warpReadScreen", () => {
+    it("renders the transcript as a screen, not as sliced lines", () => {
+      const id = createWarpSurface("reader", { cwd: warpDir });
+      const spec = readSpec(id);
+      writeFileSync(spec.log, "\u001b[32mone\u001b[0m\ntwo\nthree\nfour\n");
+      assert.equal(warpReadScreen(id, 2).trim().split("\n").at(-1), "four");
+      assert.ok(warpReadScreen(id, 10).includes("one"));
+      assert.ok(!warpReadScreen(id, 10).includes("\u001b"));
+    });
+
+    it("shows the latest TUI frame, which naive slicing would miss", () => {
+      const id = createWarpSurface("tui-reader", { cwd: warpDir });
+      const spec = readSpec(id);
+      const frame = (n: number) =>
+        `\u001b[2J\u001b[1;1Hbanner\u001b[3;1Hprogress ${n}/3`;
+      writeFileSync(spec.log, [1, 2, 3].map(frame).join(""));
+      const screen = warpReadScreen(id, 10);
+      assert.ok(screen.includes("progress 3/3"), screen);
+      assert.ok(!screen.includes("progress 1/3"), "superseded frames are gone");
+    });
+
+    it("honours PI_WARP_SCREEN=raw for bootstrap debugging", () => {
+      const id = createWarpSurface("raw-reader", { cwd: warpDir });
+      writeFileSync(readSpec(id).log, "alpha\nbeta\n");
+      process.env.PI_WARP_SCREEN = "raw";
+      try {
+        assert.ok(warpReadScreen(id, 5).includes("beta"));
+      } finally {
+        delete process.env.PI_WARP_SCREEN;
+      }
+    });
+
+    it("returns empty string when the pane has not written anything yet", () => {
+      const id = createWarpSurface("quiet", { cwd: warpDir });
+      assert.equal(warpReadScreen(id, 10).trim(), "");
+    });
+  });
+
+  describe("readSpec", () => {
+    it("throws a clear error for an unknown surface", () => {
+      assert.throws(() => readSpec("does-not-exist"), /Unknown Warp surface/);
+    });
+  });
+
+  describe("availability gating", () => {
+    it("requires the pane hook before Warp is treated as a backend", () => {
+      const prevHook = process.env.PI_WARP_HOOK;
+      delete process.env.PI_WARP_HOOK;
+      try {
+        // No receipt in the temp state dir → not available even inside Warp.
+        assert.equal(isWarpHookInstalled(), false);
+        assert.equal(isWarpRuntimeAvailable(), false);
+      } finally {
+        if (prevHook !== undefined) process.env.PI_WARP_HOOK = prevHook;
+      }
+    });
+
+    it("never claims availability outside Warp without an explicit override", () => {
+      const prevTerm = process.env.TERM_PROGRAM;
+      const prevUuid = process.env.WARP_TERMINAL_SESSION_UUID;
+      const prevLocal = process.env.WARP_IS_LOCAL_SHELL_SESSION;
+      const prevOverride = process.env.PI_MUX_BACKEND;
+      delete process.env.TERM_PROGRAM;
+      delete process.env.WARP_TERMINAL_SESSION_UUID;
+      delete process.env.WARP_IS_LOCAL_SHELL_SESSION;
+      delete process.env.PI_MUX_BACKEND;
+      try {
+        assert.equal(isInsideWarp(), false);
+        assert.equal(isWarpRuntimeAvailable(), false);
+      } finally {
+        if (prevTerm !== undefined) process.env.TERM_PROGRAM = prevTerm;
+        if (prevUuid !== undefined) process.env.WARP_TERMINAL_SESSION_UUID = prevUuid;
+        if (prevLocal !== undefined) process.env.WARP_IS_LOCAL_SHELL_SESSION = prevLocal;
+        if (prevOverride !== undefined) process.env.PI_MUX_BACKEND = prevOverride;
+      }
+    });
+  });
+
+  describe("warpDiagnostics", () => {
+    it("reports every field the doctor output needs", () => {
+      const d = warpDiagnostics();
+      for (const key of ["insideWarp", "hookInstalled", "dataDir", "stateDir", "bootstrap", "platform"]) {
+        assert.ok(key in d, `missing ${key}`);
+      }
+    });
+  });
+});
+
+// ── Warp VT screen renderer ──────────────────────────────────────────────────
+
+describe("warp-screen.ts", () => {
+  const opts = { rows: 5, cols: 20 };
+
+  describe("renderScreen", () => {
+    it("renders plain text with newlines", () => {
+      assert.equal(renderScreen("hello\nworld", opts), "hello\nworld\n\n\n");
+    });
+
+    it("applies carriage returns as overwrites, like a real terminal", () => {
+      // A progress line that rewrites itself must show only the final value.
+      assert.equal(renderScreen("50%\r100%", opts).split("\n")[0], "100%");
+    });
+
+    it("honours cursor positioning (CUP) instead of printing escapes", () => {
+      const out = renderScreen("\u001b[3;5Hmark", opts).split("\n");
+      assert.equal(out[2], "    mark");
+      assert.ok(!out.join("").includes("\u001b"));
+    });
+
+    it("clears the screen on ED(2) so stale frames do not leak", () => {
+      const out = renderScreen("junk everywhere\u001b[2J\u001b[1;1Hfresh", opts);
+      assert.equal(out.split("\n")[0], "fresh");
+      assert.ok(!out.includes("junk"));
+    });
+
+    it("clears to end of line on EL(0)", () => {
+      assert.equal(renderScreen("abcdef\u001b[4G\u001b[0K", opts).split("\n")[0], "abc");
+    });
+
+    it("drops SGR colour codes but keeps their text", () => {
+      assert.equal(renderScreen("\u001b[1;31mred\u001b[0m", opts).split("\n")[0], "red");
+    });
+
+    it("skips OSC title sequences entirely", () => {
+      assert.equal(renderScreen("\u001b]0;title\u0007body", opts).split("\n")[0], "body");
+    });
+
+    it("scrolls and preserves evicted rows as scrollback", () => {
+      const out = renderScreen("1\n2\n3\n4\n5\n6\n7", { rows: 3, cols: 10 });
+      assert.ok(out.includes("1"), "scrollback retained");
+      assert.ok(out.trimEnd().endsWith("7"), "latest row last");
+    });
+
+    it("renders the alt screen without scrollback when a TUI switches to it", () => {
+      const out = renderScreen("shell junk\u001b[?1049h\u001b[2J\u001b[1;1HTUI", opts);
+      assert.equal(out.split("\n")[0], "TUI");
+      assert.ok(!out.includes("shell junk"), "alt screen hides the main buffer");
+    });
+
+    it("wraps text beyond the column width", () => {
+      const out = renderScreen("abcdefgh", { rows: 3, cols: 4 }).split("\n");
+      assert.equal(out[0], "abcd");
+      assert.equal(out[1], "efgh");
+    });
+
+    it("handles backspace", () => {
+      assert.equal(renderScreen("abc\b\bX", opts).split("\n")[0], "aXc");
+    });
+
+    it("never emits escape characters for unknown sequences", () => {
+      const out = renderScreen("a\u001b[?25l\u001b[6nb\u001b]11;rgb:00/00/00\u0007c", opts);
+      assert.ok(!out.includes("\u001b"));
+      assert.equal(out.split("\n")[0], "abc");
+    });
+  });
+
+  describe("renderTail", () => {
+    it("returns the last N meaningful rows without trailing blanks", () => {
+      const tail = renderTail("a\nb\nc\nd\ne", 2, { rows: 10, cols: 10 });
+      assert.equal(tail, "d\ne");
+    });
+
+    it("surfaces live progress that naive line-slicing would miss", () => {
+      // TUI-style frame: repaint via CUP, no newlines at all.
+      const frame = (n: number) => `\u001b[2J\u001b[1;1Hheader\u001b[3;1H[phase1 ${n}/15] scanning`;
+      const raw = [1, 2, 3].map(frame).join("");
+      assert.ok(renderTail(raw, 5, { rows: 6, cols: 40 }).includes("[phase1 3/15]"));
+      // and the superseded frames are gone
+      assert.ok(!renderTail(raw, 5, { rows: 6, cols: 40 }).includes("[phase1 1/15]"));
+    });
+  });
+});
+
+// ── Regressions found by adversarial review of the Warp backend ──────────────
+
+describe("warp backend review regressions", () => {
+  let warpDir: string;
+  let prevState: string | undefined;
+  let prevNoLaunch: string | undefined;
+
+  before(() => {
+    warpDir = createTestDir();
+    prevState = process.env.PI_WARP_STATE_DIR;
+    prevNoLaunch = process.env.PI_WARP_NO_LAUNCH;
+    process.env.PI_WARP_STATE_DIR = warpDir;
+    process.env.PI_WARP_NO_LAUNCH = "1";
+  });
+
+  after(() => {
+    if (prevState === undefined) delete process.env.PI_WARP_STATE_DIR;
+    else process.env.PI_WARP_STATE_DIR = prevState;
+    if (prevNoLaunch === undefined) delete process.env.PI_WARP_NO_LAUNCH;
+    else process.env.PI_WARP_NO_LAUNCH = prevNoLaunch;
+    rmSync(warpDir, { recursive: true, force: true });
+  });
+
+  describe("VT parser", () => {
+    it("consumes CSI intermediate bytes (DECSCUSR) instead of leaking the final byte", () => {
+      // "ESC [ 6 SP q" — emitted by vim and many prompts. The space is an
+      // intermediate byte, not the final byte; mis-parsing printed a stray "q".
+      assert.equal(renderScreen("a\u001b[6 qb", { rows: 2, cols: 20 }).split("\n")[0], "ab");
+    });
+
+    it("keeps astral characters whole at the wrap boundary", () => {
+      const rows = renderScreen("abc\u{1F600}d", { rows: 3, cols: 4 }).split("\n");
+      const split = rows.some((r) => /[\uD800-\uDBFF]$|^[\uDC00-\uDFFF]/.test(r));
+      assert.equal(split, false, `surrogate pair split across rows: ${JSON.stringify(rows)}`);
+      assert.ok(rows.join("").includes("\u{1F600}"));
+    });
+
+    it("accounts for double-width glyphs when wrapping", () => {
+      assert.equal(charWidth(0x6f22), 2, "CJK is two cells");
+      assert.equal(charWidth(0x1f600), 2, "emoji is two cells");
+      assert.equal(charWidth(0x61), 1, "ascii is one cell");
+      // 3 wide glyphs = 6 columns, so the 4th must wrap in a 6-column grid.
+      const rows = renderScreen("漢字漢", { rows: 3, cols: 6 }).split("\n");
+      assert.equal(rows[0], "漢字漢");
+    });
+  });
+
+  describe("shell quoting (surface.env)", () => {
+    it("neutralises quotes, backslashes and command substitution", () => {
+      const nasty = `it's \\ "q" $(touch /tmp/PWNED) \`id\``;
+      const quoted = shQuote(nasty);
+      assert.ok(quoted.startsWith("'") && quoted.endsWith("'"));
+      // Round-trip through a real shell: the value must come back byte-identical.
+      const out = execFileSync("/bin/sh", ["-c", `printf %s ${quoted}`], { encoding: "utf8" });
+      assert.equal(out, nasty);
+    });
+
+    it("emits a sourceable env file and drops invalid variable names", () => {
+      const env = renderSurfaceEnv({
+        protocol: 1,
+        id: "x",
+        name: "na'me",
+        cwd: "/tmp",
+        command: `echo "hi" && echo 'bye'`,
+        log: "/l",
+        input: "/i",
+        status: "/s",
+        createdAt: 0,
+        env: { GOOD: "v'v", "BAD-NAME": "nope" },
+      } as any);
+      assert.ok(env.includes("export GOOD="));
+      assert.ok(!env.includes("BAD-NAME"), "invalid identifier must not be emitted");
+      // Sourcing it must not execute the embedded command substitution.
+      const envFile = join(warpDir, "probe.env");
+      writeFileSync(envFile, env);
+      const probe = execFileSync(
+        "/bin/sh",
+        ["-c", `. "$1"; printf %s "$PI_WARP_COMMAND"`, "sh", envFile],
+        { encoding: "utf8" },
+      );
+      assert.equal(probe, `echo "hi" && echo 'bye'`);
+      assert.equal(existsSync("/tmp/PWNED"), false, "no command substitution ran");
+    });
+  });
+
+  describe("send-before-ready", () => {
+    it("reports a starting pane as retryable, not as a dead one", () => {
+      const id = createWarpSurface("not-ready", { cwd: warpDir });
+      assert.equal(readStatus(id)?.state, "starting");
+      assert.throws(
+        () => warpSendCommand(id, "echo hi"),
+        /still starting/,
+        "must not claim the pane closed before it ever opened",
+      );
+    });
+  });
+
+  describe("bounded transcript reads", () => {
+    it("only replays the tail of a very large log", () => {
+      const id = createWarpSurface("big-log", { cwd: warpDir });
+      const spec = readSpec(id);
+      const filler = "x".repeat(1024) + "\n";
+      writeFileSync(spec.log, filler.repeat(400) + "FINAL_MARKER\n"); // ~400KB
+      process.env.PI_WARP_LOG_TAIL_BYTES = "4096";
+      try {
+        const screen = warpReadScreen(id, 5);
+        assert.ok(screen.includes("FINAL_MARKER"), "tail is what matters");
+      } finally {
+        delete process.env.PI_WARP_LOG_TAIL_BYTES;
+      }
+    });
+  });
+});
+
+// ── UTF-8 boundary safety in bounded transcript reads (found by re-audit) ────
+
+describe("warp readTail UTF-8 alignment", () => {
+  let dir: string;
+  let prevState: string | undefined;
+  let prevNoLaunch: string | undefined;
+
+  before(() => {
+    dir = createTestDir();
+    prevState = process.env.PI_WARP_STATE_DIR;
+    prevNoLaunch = process.env.PI_WARP_NO_LAUNCH;
+    process.env.PI_WARP_STATE_DIR = dir;
+    process.env.PI_WARP_NO_LAUNCH = "1";
+  });
+
+  after(() => {
+    if (prevState === undefined) delete process.env.PI_WARP_STATE_DIR;
+    else process.env.PI_WARP_STATE_DIR = prevState;
+    if (prevNoLaunch === undefined) delete process.env.PI_WARP_NO_LAUNCH;
+    else process.env.PI_WARP_NO_LAUNCH = prevNoLaunch;
+    delete process.env.PI_WARP_LOG_TAIL_BYTES;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("never emits U+FFFD regardless of where the byte cut lands", () => {
+    const id = createWarpSurface("utf8", { cwd: dir });
+    // 4-byte emoji followed by a 3-byte CJK char: cuts can land 1-3 bytes in.
+    writeFileSync(readSpec(id).log, "A".repeat(200) + "😀漢 END\n");
+    const corrupted: number[] = [];
+    for (let tail = 8; tail <= 24; tail++) {
+      process.env.PI_WARP_LOG_TAIL_BYTES = String(tail);
+      if (warpReadScreen(id, 3).includes("\uFFFD")) corrupted.push(tail);
+    }
+    assert.deepEqual(corrupted, [], `byte cuts corrupted characters at tails: ${corrupted}`);
+  });
+
+  it("drops an incomplete trailing sequence (pty still mid-write)", () => {
+    // Valid text then the first 2 bytes of a 3-byte character.
+    const partial = Buffer.concat([
+      Buffer.from("hello ", "utf8"),
+      Buffer.from([0xe6, 0xbc]), // truncated 漢
+    ]);
+    const aligned = alignUtf8(partial).toString("utf8");
+    assert.equal(aligned, "hello ");
+    assert.ok(!aligned.includes("\uFFFD"));
+  });
+
+  it("leaves an already-aligned buffer untouched", () => {
+    const buf = Buffer.from("plain ascii", "utf8");
+    assert.equal(alignUtf8(buf).toString("utf8"), "plain ascii");
   });
 });
