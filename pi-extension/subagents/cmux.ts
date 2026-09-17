@@ -9,13 +9,13 @@ const execFileAsync = promisify(execFile);
 import {
   createWarpSurface,
   isWarpRuntimeAvailable,
+  paneShell,
   warpCloseSurface,
   warpReadScreen,
   warpReadScreenAsync,
   warpRenameTab,
   warpSendCommand,
   warpSendEscape,
-  warpSetupHint,
 } from "./warp.ts";
 
 export type MuxBackend = "psmux" | "wezterm" | "warp";
@@ -163,9 +163,7 @@ export function isMuxAvailable(): boolean {
 }
 
 export function muxSetupHint(): string {
-  const base = "Start pi inside psmux (`psmux new -s pi -- pi`), WezTerm, or Warp.";
-  // Inside Warp the actionable fix is almost always the missing pane hook.
-  return process.env.TERM_PROGRAM === "WarpTerminal" ? `${base} ${warpSetupHint()}` : base;
+  return "Start pi inside psmux (`psmux new -s pi -- pi`), WezTerm, or Warp.";
 }
 
 function requireMuxBackend(): MuxBackend {
@@ -217,15 +215,19 @@ export function exitStatusVar(): string {
  *
  * - psmux on Windows → panes are always PowerShell.
  * - WezTerm on Windows → panes inherit the default shell (usually PowerShell).
+ * - Warp → whatever `PI_WARP_PANE_SHELL` says, because Warp on Windows can be
+ *   configured to open Git Bash / MSYS2 / WSL tabs. Assuming PowerShell from
+ *   `process.platform` alone sent `.ps1` launchers into bash panes.
  *
  * Environment variables like BASH_VERSION, MSYSTEM, and SHELL belong to the
  * *parent* process and must NOT be used to infer the pane shell when running
  * under psmux on Windows.
  */
 export function isPowerShellTarget(): boolean {
+  if (getMuxBackend() === "warp") return paneShell() === "powershell";
+
   // psmux on Windows → panes are always PowerShell.
   // WezTerm on Windows → panes default to PowerShell.
-  // Warp on Windows → panes default to PowerShell too.
   if (process.platform === "win32") return true;
 
   // Non-Windows: use parent shell hints as a best-effort fallback.

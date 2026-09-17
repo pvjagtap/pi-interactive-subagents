@@ -815,7 +815,7 @@ async function launchSubagent(
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
   const denySet = resolveDenyTools(agentDefs);
-  const agentType = params.agent ?? params.name;
+  const agentType = params.agent || params.name;
   const tabTitleInstruction = denySet.has("isub_set_tab_title")
     ? ""
     : `As your FIRST action, set the tab title using set_tab_title. ` +
@@ -829,6 +829,19 @@ async function launchSubagent(
   const fullTask = params.fork
     ? params.task
     : `${roleBlock}\n\n${modeHint}\n\n${tabTitleInstruction}\n\n${params.task}\n\n${summaryInstruction}`;
+
+  // pi turns a bare `@file` argument into a `<file>` block with no surrounding
+  // user text, and agents read a lone attachment as a document to comment on —
+  // observed replying "this is a prompt for a subagent, not a task for me" and
+  // offering to spawn one. This directive is passed as the message after the
+  // block so the last thing the agent reads is what to do with it.
+  const taskDirective = [
+    `You are the sub-agent "${params.name}". The file above is your own task assignment, not a document to review.`,
+    `Start working on it now: do not summarise it back, do not ask whether to proceed, and do not spawn another sub-agent to do it.`,
+    agentDefs?.autoExit ? "" : `When the work is finished, call the subagent_done tool.`,
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   // Build pi command
   const parts: string[] = ["pi"];
@@ -937,6 +950,7 @@ async function launchSubagent(
     mkdirSync(dirname(artifactPath), { recursive: true });
     writeFileSync(artifactPath, fullTask, "utf8");
     parts.push(shellEscape(`@${artifactPath}`));
+    parts.push(shellEscape(taskDirective));
   }
 
   // Resolve cwd — param overrides agent default, supports absolute and relative paths.
@@ -1547,6 +1561,12 @@ export default function subagentsExtension(
           mkdirSync(dirname(resumeMsgFile), { recursive: true });
           writeFileSync(resumeMsgFile, params.message, "utf8");
           parts.push(shellEscape(`@${resumeMsgFile}`));
+          parts.push(
+            shellEscape(
+              "The file above is a message from the parent agent addressed to you. " +
+                "Act on it now, then call the subagent_done tool when the work is finished.",
+            ),
+          );
         }
 
         // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation

@@ -31,8 +31,12 @@ import {
   readScreenAsync,
   closeSurface,
   shellEscape,
+  shellPath,
+  isPowerShellTarget,
+  exitStatusVar,
   type MuxBackend,
 } from "../../pi-extension/subagents/cmux.ts";
+import { surfaceDir } from "../../pi-extension/subagents/warp.ts";
 
 // Re-export mux primitives for tests
 export {
@@ -44,6 +48,7 @@ export {
   readScreenAsync,
   closeSurface,
   shellEscape,
+  isPowerShellTarget,
 };
 export type { MuxBackend };
 
@@ -164,6 +169,24 @@ export function untrackSurface(env: TestEnv, surface: string): void {
   env.surfaces = env.surfaces.filter((s) => s !== surface);
 }
 
+/**
+ * Whether a surface can accept keystrokes and report its screen back.
+ *
+ * A Warp PowerShell pane runs in "direct mode": no pty is interposed, so the
+ * bootstrap records `injectable:false` and every screen read returns "". Tests
+ * that assert on screen content have nothing to assert against there.
+ */
+export function isInjectable(surface: string): boolean {
+  if (getMuxBackend() !== "warp") return true;
+  const statusFile = join(surfaceDir(surface), "status.json");
+  if (!existsSync(statusFile)) return false;
+  try {
+    return JSON.parse(readFileSync(statusFile, "utf8")).injectable === true;
+  } catch {
+    return false;
+  }
+}
+
 // ── Pi session management ──
 
 /**
@@ -181,9 +204,12 @@ export function startPi(
 ): void {
   const model = opts?.model ?? TEST_MODEL;
   const extra = opts?.extraArgs ?? "";
+  const ps = isPowerShellTarget();
 
   const cmd = [
-    `cd ${shellEscape(testDir)} &&`,
+    ps
+      ? `Set-Location ${shellEscape(shellPath(testDir))};`
+      : `cd ${shellEscape(shellPath(testDir))} &&`,
     `pi`,
     `--model ${shellEscape(model)}`,
     extra,
@@ -192,8 +218,14 @@ export function startPi(
     .filter(Boolean)
     .join(" ");
 
-  sendLongCommand(surface, `${cmd}; echo '__TEST_DONE_'$?'__'`, {
-    scriptPath: join(testDir, `test-launch-${Date.now()}.sh`),
+  const done = ps
+    ? `Write-Host "__TEST_DONE_$($LASTEXITCODE)__"`
+    : `echo '__TEST_DONE_'${exitStatusVar()}'__'`;
+
+  // The pane shell decides the extension: PowerShell ShellExecutes an unknown
+  // one, which pops a Windows "open with" dialog instead of running anything.
+  sendLongCommand(surface, `${cmd}; ${done}`, {
+    scriptPath: join(testDir, `test-launch-${Date.now()}${ps ? ".ps1" : ".sh"}`),
   });
 }
 

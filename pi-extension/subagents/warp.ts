@@ -6,12 +6,10 @@
  * handshake** instead of keystroke injection:
  *
  *   1. We allocate a surface directory and drop `.pi-warp-surface` + `surface.json`.
- *   2. We ask Warp to open a tab whose cwd IS that directory
- *      (`warp://action/new_tab?path=<surface dir>` — works on Linux, Windows and
- *      macOS, needs no Warp "Scripting" toggle).
- *   3. A tiny shell hook (installed once into bashrc/zshrc/fish/PowerShell
- *      profile — see `scripts/install-warp-hook.mjs`) notices the marker, and
- *      execs `pi-warp-bootstrap`, which becomes the pane driver:
+ *   2. We generate a Warp **tab config** for that surface whose single pane has
+ *      `directory = <surface dir>` and a startup `commands` entry pointing at
+ *      `pi-warp-bootstrap`, then open it with `warp://tab_config/<name>`.
+ *   3. `pi-warp-bootstrap` becomes the pane driver:
  *        - runs the requested command under a pty (`script -qfe` on Unix),
  *        - mirrors everything to `out.log`  → gives us `readScreen`,
  *        - feeds `in.fifo` into the child's stdin → gives us `sendCommand` /
@@ -40,18 +38,38 @@ import {
   readdirSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { renderTail } from "./warp-screen.ts";
 
 const execFileAsync = promisify(execFile);
 
 /** Bumped when the on-disk surface handshake changes shape. */
-export const WARP_SURFACE_PROTOCOL = 1;
+export const WARP_SURFACE_PROTOCOL = 2;
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+const PKG_ROOT = resolve(HERE, "..", "..");
+
+/**
+ * Shell family the *pane* will run, which is not the same thing as the platform
+ * pi itself runs on: Warp on Windows can be configured to open Git Bash / MSYS2
+ * / WSL tabs, and those need the POSIX bootstrap, a FIFO and a `.sh` launcher.
+ * Deciding this from `process.platform` is what made the documented "Git Bash on
+ * Windows" path silently send base64 spool records into a bash stdin.
+ */
+export type WarpPaneShell = "posix" | "powershell";
+
+export function paneShell(): WarpPaneShell {
+  const override = process.env.PI_WARP_PANE_SHELL?.trim().toLowerCase();
+  if (override === "posix" || override === "bash" || override === "wsl") return "posix";
+  if (override === "powershell" || override === "pwsh") return "powershell";
+  return process.platform === "win32" ? "powershell" : "posix";
+}
 
 /** Files that make up one surface directory. */
 export const SURFACE_FILES = {
@@ -60,8 +78,14 @@ export const SURFACE_FILES = {
   env: "surface.env",
   status: "status.json",
   log: "out.log",
-  input: process.platform === "win32" ? "in.cmd" : "in.fifo",
+  /** Launch command handed to a pane that has not bootstrapped yet. */
+  command: "command.txt",
 } as const;
+
+/** Input channel name. POSIX panes get a real FIFO; PowerShell panes have none. */
+export function inputFileName(shell: WarpPaneShell): string {
+  return shell === "posix" ? "in.fifo" : "in.cmd";
+}
 
 /** POSIX single-quote escaping: the only safe way to hand data to a shell. */
 export function shQuote(value: string): string {
@@ -77,6 +101,7 @@ export function renderSurfaceEnv(spec: WarpSurfaceSpec): string {
     `PI_WARP_NAME=${shQuote(spec.name)}`,
     `PI_WARP_CWD=${shQuote(spec.cwd)}`,
     `PI_WARP_COMMAND=${shQuote(spec.command ?? "")}`,
+    `PI_WARP_COMMAND_FILE=${shQuote(spec.commandFile)}`,
     `PI_WARP_LOG=${shQuote(spec.log)}`,
     `PI_WARP_INPUT=${shQuote(spec.input)}`,
     `PI_WARP_STATUS=${shQuote(spec.status)}`,
@@ -96,6 +121,14 @@ export interface WarpSurfaceSpec {
   cwd: string;
   /** Command executed by the bootstrap (a script path, usually). */
   command: string | null;
+  /**
+   * Where a *late* launch command is dropped. The parent cannot wait for a Warp
+   * tab to open before it has a command to send, so the first pre-bootstrap
+   * send lands here and the bootstrap picks it up when it starts.
+   */
+  commandFile: string;
+  /** Shell family this pane runs — decides bootstrap, launcher and input channel. */
+  shell: WarpPaneShell;
   /** Absolute paths, resolved for the pane's shell. */
   log: string;
   input: string;
@@ -123,6 +156,8 @@ export interface WarpSurfaceStatus {
   title?: string;
   /** Warp pane id, filled in by `warpctrl` when local control is available. */
   paneId?: string;
+  /** False when the pane cannot accept live keystrokes (PowerShell direct mode). */
+  injectable?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -145,17 +180,30 @@ export function isInsideWarp(): boolean {
   );
 }
 
-/** Warp per-channel data dir (`~/.warp`, `~/.warp-preview`, ...). */
+/**
+ * Warp's "portable user data" root (themes, tab configs). Only macOS keeps this
+ * in `~/.warp`; Warp on Windows explicitly does not read the home-directory
+ * path, so writing there silently produces tab configs Warp never loads.
+ */
 export function warpDataDir(): string {
   const explicit = process.env.PI_WARP_DATA_DIR;
   if (explicit) return explicit;
   const home = homedir();
-  const channels = [".warp", ".warp-preview", ".warp-dev", ".warp-oss"];
-  for (const c of channels) {
-    const p = join(home, c);
-    if (existsSync(p)) return p;
+
+  if (process.platform === "win32") {
+    const appData = process.env.APPDATA ?? join(home, "AppData", "Roaming");
+    const stable = join(appData, "warp", "Warp", "data");
+    return firstExisting([stable, join(appData, "warp", "WarpPreview", "data")]) ?? stable;
   }
-  return join(home, ".warp");
+
+  if (process.platform === "darwin") {
+    const channels = [".warp", ".warp-preview", ".warp-dev", ".warp-oss"];
+    return firstExisting(channels.map((c) => join(home, c))) ?? join(home, ".warp");
+  }
+
+  const dataHome = process.env.XDG_DATA_HOME ?? join(home, ".local", "share");
+  const stable = join(dataHome, "warp-terminal");
+  return firstExisting([stable, join(dataHome, "warp-terminal-preview")]) ?? stable;
 }
 
 let resolvedWarpBin: string | null | undefined;
@@ -217,10 +265,19 @@ export function getWarpctrlBin(): string | null {
   return null;
 }
 
-/** True when `warpctrl` exists AND a same-channel instance answers. */
+let warpctrlProbe: { bin: string; answered: boolean } | undefined;
+/**
+ * True when `warpctrl` exists AND a same-channel instance answers.
+ *
+ * Memoised: the probe spawns a process with a 4s timeout and sits on the hot
+ * path (`createWarpSurface` alone asked twice), so an uncached call could stall
+ * pi's event loop for seconds per subagent launch.
+ */
 export function isWarpctrlAvailable(): boolean {
   const bin = getWarpctrlBin();
   if (!bin) return false;
+  if (warpctrlProbe?.bin === bin) return warpctrlProbe.answered;
+  let answered = false;
   try {
     const out = execFileSync(bin, ["--output-format", "json", "instance", "list"], {
       encoding: "utf8",
@@ -229,10 +286,12 @@ export function isWarpctrlAvailable(): boolean {
     });
     const parsed = JSON.parse(out);
     const instances = parsed?.instances ?? parsed?.data?.instances ?? [];
-    return Array.isArray(instances) && instances.length > 0;
+    answered = Array.isArray(instances) && instances.length > 0;
   } catch {
-    return false;
+    answered = false;
   }
+  warpctrlProbe = { bin, answered };
+  return answered;
 }
 
 /** Root for surface directories and installer receipts. */
@@ -249,47 +308,20 @@ export function warpStateDir(): string {
   return join(xdg, "pi-interactive-subagents", "warp");
 }
 
-export function hookReceiptPath(): string {
-  return join(warpStateDir(), "hook-installed.json");
-}
-
 /**
- * The pane hook is what makes Warp scriptable for us. Without it a new Warp
- * tab is just an idle shell and nothing can be launched into it.
- */
-export function isWarpHookInstalled(): boolean {
-  if (process.env.PI_WARP_HOOK === "1") return true;
-  return existsSync(hookReceiptPath());
-}
-
-/**
- * Warp counts as an available backend when:
- *  - pi is running inside Warp (or the user forced `PI_MUX_BACKEND=warp`),
- *  - we can hand URLs to the Warp app,
- *  - the pane bootstrap hook is installed.
+ * Warp counts as an available backend when pi is running inside Warp (or the
+ * user forced `PI_MUX_BACKEND=warp`) and we can hand URLs to the Warp app.
+ * A tab config carries the launch command, so no shell-side setup is required.
  */
 export function isWarpRuntimeAvailable(): boolean {
   if (!isInsideWarp() && process.env.PI_MUX_BACKEND?.toLowerCase() !== "warp") return false;
-  if (!getWarpBin() && !canOpenUrlGenerically()) return false;
-  return isWarpHookInstalled();
+  return getWarpBin() != null || canOpenUrlGenerically();
 }
 
 function canOpenUrlGenerically(): boolean {
   if (process.platform === "win32") return true; // `cmd /c start`
   if (process.platform === "darwin") return true; // `open`
   return existsSync("/usr/bin/xdg-open");
-}
-
-export function warpSetupHint(): string {
-  const lines = [
-    "Warp detected, but the pi pane hook is not installed yet.",
-    "Run: node scripts/install-warp-hook.mjs --install",
-    "(adds one guarded line to your shell profile; `--uninstall` reverts it).",
-  ];
-  if (process.platform === "win32") {
-    lines.push("On Windows the hook is installed into your PowerShell $PROFILE.");
-  }
-  return lines.join(" ");
 }
 
 // ---------------------------------------------------------------------------
@@ -309,9 +341,67 @@ function newSurfaceId(): string {
 }
 
 /** Bootstrap script shipped with the package, per pane shell family. */
-export function bootstrapScriptPath(): string {
-  const file = process.platform === "win32" ? "pi-warp-bootstrap.ps1" : "pi-warp-bootstrap.sh";
+export function bootstrapScriptPath(shell: WarpPaneShell = paneShell()): string {
+  const file = shell === "powershell" ? "pi-warp-bootstrap.ps1" : "pi-warp-bootstrap.sh";
   return join(HERE, "warp-bootstrap", file);
+}
+
+/** How long an exited surface directory is kept for post-mortem inspection. */
+function surfaceTtlMs(): number {
+  const raw = Number(process.env.PI_WARP_SURFACE_TTL_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 24 * 60 * 60 * 1000;
+}
+
+function surfaceRetainCount(): number {
+  const raw = Number(process.env.PI_WARP_SURFACE_RETAIN);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 50;
+}
+
+/**
+ * Drop finished surface directories.
+ *
+ * Nothing else reclaims them: `closeSurface` only removes the marker, so every
+ * subagent ever launched would leave its full pty transcript behind forever.
+ * Only surfaces that are already exited (and past the TTL) are touched, so a
+ * live pane and a recent post-mortem both survive.
+ */
+export function gcWarpSurfaces(): void {
+  const root = surfacesRoot();
+  if (!existsSync(root)) return;
+  const ttl = surfaceTtlMs();
+  const now = Date.now();
+  const finished: { id: string; at: number }[] = [];
+
+  let entries: string[];
+  try {
+    entries = readdirSync(root);
+  } catch {
+    return;
+  }
+
+  for (const id of entries) {
+    const status = readStatus(id);
+    if (status && status.state !== "exited") continue;
+    let at = status?.updatedAt ?? 0;
+    if (!at) {
+      try {
+        at = statSync(join(root, id)).mtimeMs;
+      } catch {
+        continue;
+      }
+    }
+    if (now - at > ttl) {
+      warpDisposeSurface(id);
+    } else {
+      finished.push({ id, at });
+    }
+  }
+
+  const retain = surfaceRetainCount();
+  if (finished.length > retain) {
+    finished.sort((a, b) => a.at - b.at);
+    for (const { id } of finished.slice(0, finished.length - retain)) warpDisposeSurface(id);
+  }
 }
 
 export interface CreateWarpSurfaceOptions {
@@ -323,6 +413,8 @@ export interface CreateWarpSurfaceOptions {
   env?: Record<string, string>;
   /** `tab` (default) gives each subagent full width; `split` uses warpctrl. */
   mode?: "tab" | "split";
+  /** Override the pane shell family (defaults to `paneShell()`). */
+  shell?: WarpPaneShell;
   /** Split direction, only meaningful with warpctrl available. */
   direction?: "left" | "right" | "up" | "down";
 }
@@ -333,18 +425,23 @@ export interface CreateWarpSurfaceOptions {
  * function in this module.
  */
 export function createWarpSurface(name: string, options: CreateWarpSurfaceOptions = {}): string {
+  gcWarpSurfaces();
+
   const id = newSurfaceId();
   const dir = surfaceDir(id);
   mkdirSync(dir, { recursive: true });
 
+  const shell = options.shell ?? paneShell();
   const spec: WarpSurfaceSpec = {
     protocol: WARP_SURFACE_PROTOCOL,
     id,
     name,
     cwd: options.cwd ?? process.cwd(),
     command: options.command ?? null,
+    commandFile: join(dir, SURFACE_FILES.command),
+    shell,
     log: join(dir, SURFACE_FILES.log),
-    input: join(dir, SURFACE_FILES.input),
+    input: join(dir, inputFileName(shell)),
     status: join(dir, SURFACE_FILES.status),
     createdAt: Date.now(),
     env: {
@@ -367,14 +464,11 @@ export function createWarpSurface(name: string, options: CreateWarpSurfaceOption
   writeFileSync(join(dir, SURFACE_FILES.marker), `${WARP_SURFACE_PROTOCOL}\n`);
 
   if (options.mode === "split" && isWarpctrlAvailable()) {
-    // warpctrl splits the *active* pane and the new pane inherits the active
-    // pane's cwd, so we cd via the hook marker copied into the split's cwd.
+    // warpctrl splits the *active* pane; the split inherits our cwd, so the
+    // surface dir still has to be handed over explicitly.
     warpctrl(["pane", "split", "--direction", options.direction ?? "right"]);
-    // The split inherits our cwd; hand it the surface dir explicitly.
-    openWarpTab(dir);
-  } else {
-    openWarpTab(dir);
   }
+  openWarpSurfaceTab(id);
 
   if (isWarpctrlAvailable()) {
     try {
@@ -386,11 +480,22 @@ export function createWarpSurface(name: string, options: CreateWarpSurfaceOption
   return id;
 }
 
-/** Ask the running Warp app to open a new tab rooted at `path`. */
-export function openWarpTab(path: string): void {
+/**
+ * Open the Warp tab for a surface.
+ *
+ * `warp://action/new_tab?path=` carries a directory and nothing else, which is
+ * why this backend used to need a shell-profile hook to bootstrap the pane. A
+ * tab config carries `commands`, so the launch command rides along with the tab
+ * and Warp behaves like the psmux/WezTerm control CLIs.
+ */
+export function openWarpSurfaceTab(id: string): void {
+  const name = writeTabConfig(id);
   // Escape hatch for tests / dry-runs: prepare the surface but do not open UI.
   if (process.env.PI_WARP_NO_LAUNCH === "1") return;
-  const url = `warp://action/new_tab?path=${encodeURIComponent(path)}`;
+  openWarpUrl(`warp://tab_config/${encodeURIComponent(name)}`);
+}
+
+function openWarpUrl(url: string): void {
   const bin = getWarpBin();
   if (bin) {
     detach(bin, [url]);
@@ -442,7 +547,7 @@ export function readStatus(id: string): WarpSurfaceStatus | null {
     const reconciled: WarpSurfaceStatus = {
       ...status,
       state: "exited",
-      exitCode: status.exitCode ?? null ?? undefined,
+      exitCode: status.exitCode,
       stale: true,
       updatedAt: Date.now(),
     };
@@ -482,13 +587,8 @@ function writeStatus(id: string, status: WarpSurfaceStatus): void {
   renameSync(tmp, target);
 }
 
-/**
- * Queue text for the pane. The bootstrap feeds `in.fifo` straight into the
- * child's stdin, so this reaches a running TUI exactly like `send-keys -l`.
- */
-export function warpSendText(id: string, text: string): void {
-  const spec = readSpec(id);
-  const status = readStatus(id);
+/** Throws unless the surface is live and ready to receive keystrokes. */
+function assertLive(id: string, spec: WarpSurfaceSpec, status: WarpSurfaceStatus | null): void {
   if (status?.state === "exited") {
     throw new Error(
       `Warp surface ${id} has exited (code ${status.exitCode ?? "unknown"}); nothing to send to.`,
@@ -497,25 +597,42 @@ export function warpSendText(id: string, text: string): void {
   // Distinguish "tab has not opened yet" from "pane died". The FIFO only exists
   // once the bootstrap runs, so a send issued straight after createWarpSurface()
   // must read as retryable, not as a dead pane. A surface that never reaches
-  // "running" (hook missing, tab never opened) would otherwise report "retry
-  // shortly" forever, so it becomes a hard error once the budget elapses.
-  if (status?.state === "starting" && !existsSync(spec.input)) {
-    const age = Date.now() - (status.updatedAt ?? spec.createdAt);
+  // "running" would otherwise report "retry shortly" forever, so it becomes a
+  // hard error once the budget elapses.
+  if (!existsSync(spec.input)) {
+    const age = Date.now() - (status?.updatedAt ?? spec.createdAt);
     if (age > startTimeoutMs()) {
       throw new Error(
-        `Warp surface ${id} never bootstrapped after ${Math.round(age / 1000)}s. ` +
-          `The tab may have failed to open, or the pane hook is not installed — ${warpSetupHint()}`,
+        `Warp surface ${id} never bootstrapped after ${Math.round(age / 1000)}s; ` +
+          `the tab config may have failed to open. Check: ${join(warpDataDir(), "tab_configs", `${tabConfigName(id)}.toml`)}`,
       );
     }
     throw new Error(
       `Warp surface ${id} is still starting (the tab has not bootstrapped yet); retry shortly.`,
     );
   }
-  if (process.platform === "win32") {
-    // No FIFOs: append to a spool file the PowerShell bootstrap drains.
-    appendSpool(spec.input, text);
-    return;
+}
+
+/**
+ * Queue raw keystrokes for the pane. The bootstrap feeds `in.fifo` straight
+ * into the child's stdin, so this reaches a running TUI exactly like
+ * `send-keys -l`.
+ */
+export function warpSendText(id: string, text: string): void {
+  const spec = readSpec(id);
+  assertLive(id, spec, readStatus(id));
+
+  if (spec.shell === "powershell") {
+    // Without ConPTY there is no way to push bytes into a console child's stdin
+    // from a sibling process, so this used to spool into a file nothing drained
+    // — the send silently vanished. Failing loudly is the honest contract.
+    throw new Error(
+      `Warp surface ${id} is a PowerShell pane: live keystroke injection is not supported. ` +
+        `Use a Git Bash / MSYS2 / WSL pane (PI_WARP_PANE_SHELL=posix) for interactive sends, ` +
+        `or drive the sub-agent to completion via subagent_done.`,
+    );
   }
+
   // Writing to a FIFO blocks until a reader attaches; the bootstrap keeps one
   // open for the pane's lifetime, and we cap the wait so a dead pane can't hang pi.
   writeFifo(spec.input, text);
@@ -529,10 +646,33 @@ export function warpSendText(id: string, text: string): void {
  * but raw-mode TUIs (pi, claude, codex …) only accept CR, and silently keep
  * the text sitting unsubmitted in their input box otherwise.
  * Override with PI_WARP_SUBMIT_KEY=cr|lf|crlf if a pane needs something else.
+ *
+ * Before the pane has bootstrapped this does NOT fail. Opening a Warp tab is an
+ * asynchronous round trip through the OS URL handler, the app, the user's rc
+ * files and Warp's own shell bootstrap, which routinely outlasts the caller's
+ * fixed shell-ready delay. The first such command is therefore *handed to* the
+ * surface as a launch command and the bootstrap runs it when it comes up — the
+ * pane no longer has to exist before we know what to run in it.
  */
 export function warpSendCommand(id: string, command: string): void {
+  const spec = readSpec(id);
+  const status = readStatus(id);
+
+  if (status?.state !== "exited" && !existsSync(spec.input) && !existsSync(spec.commandFile)) {
+    writeCommandFile(spec.commandFile, command);
+    return;
+  }
+
   warpSendText(id, command + submitKey());
 }
+
+/** Atomic so the bootstrap never sources a half-written launch command. */
+function writeCommandFile(path: string, command: string): void {
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, command.replace(/\r?\n$/, "") + "\n");
+  renameSync(tmp, path);
+}
+
 
 export function submitKey(): string {
   switch (process.env.PI_WARP_SUBMIT_KEY?.trim().toLowerCase()) {
@@ -549,11 +689,29 @@ export function warpSendEscape(id: string): void {
   warpSendText(id, "\x1b");
 }
 
-function appendSpool(path: string, text: string): void {
-  // Each record is one length-prefixed line so partial reads can't split escapes.
-  const payload = `${Buffer.byteLength(text, "utf8")}:${Buffer.from(text, "utf8").toString("base64")}\n`;
-  mkdirSync(dirname(path), { recursive: true });
-  appendFileSync(path, payload);
+/**
+ * A POSIX pane's input channel is a FIFO, and only a POSIX shell can open one
+ * for writing. On Windows that means the MSYS/Git-Bash `sh` — a native Win32
+ * `writeFileSync` cannot talk to an MSYS FIFO at all.
+ */
+function posixShellBin(): string {
+  if (process.env.PI_WARP_SH) return process.env.PI_WARP_SH;
+  if (process.platform !== "win32") return "/bin/sh";
+  for (const candidate of ["sh", "bash"]) {
+    try {
+      const found = execFileSync("where", [candidate], { encoding: "utf8", timeout: 5000 })
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .find(Boolean);
+      if (found) return found;
+    } catch {
+      /* not on PATH */
+    }
+  }
+  throw new Error(
+    "Writing to a Warp POSIX pane needs a POSIX shell (Git Bash/MSYS2) on PATH. " +
+      "Install one, or set PI_WARP_SH, or run the pane with PI_WARP_PANE_SHELL=powershell.",
+  );
 }
 
 function writeFifo(path: string, text: string): void {
@@ -562,15 +720,18 @@ function writeFifo(path: string, text: string): void {
       `Warp surface input channel is gone (${path}). The pane closed or the bootstrap exited.`,
     );
   }
+  // MSYS `sh` does not understand `D:\a\b`, so hand it the POSIX form.
+  const target =
+    process.platform === "win32"
+      ? path.replace(/\\/g, "/").replace(/^([A-Za-z]):/, (_m, d: string) => `/${d.toLowerCase()}`)
+      : path;
   // The bootstrap holds the FIFO open for the pane's lifetime, so this returns
   // immediately; the timeout stops a dead pane from ever hanging the parent.
-  execFileSync("/bin/sh", ["-c", `printf %s "$0" > "$1"`, text, path], {
+  execFileSync(posixShellBin(), ["-c", `printf %s "$0" > "$1"`, text, target], {
     encoding: "utf8",
     timeout: 3000,
   });
 }
-
-import { renderTail } from "./warp-screen.ts";
 
 const ANSI = /[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
 /** OSC sequences (window titles, hyperlinks) terminated by BEL or ST. */
@@ -689,22 +850,50 @@ export async function warpReadScreenAsync(id: string, lines = 50): Promise<strin
   return warpReadScreen(id, lines);
 }
 
+/**
+ * Strip control bytes and cap length before a title reaches an OSC string.
+ * Titles are caller-supplied data, and a raw ESC/BEL in a title sequence is
+ * escape injection into the user's terminal.
+ */
+export function sanitizeTitle(title: string): string {
+  // eslint-disable-next-line no-control-regex
+  return String(title).replace(/[\u0000-\u001f\u007f\u009b]/g, "").slice(0, 120);
+}
+
 /** Rename the Warp pane/tab when local control is available. */
 export function warpRename(id: string, title: string): void {
   if (!isWarpctrlAvailable()) return;
   const status = readStatus(id);
   const target = status?.paneId ? ["--pane", status.paneId] : [];
   try {
-    warpctrl(["pane", "rename", ...target, title]);
+    warpctrl(["pane", "rename", ...target, sanitizeTitle(title)]);
   } catch {
     /* cosmetic */
   }
 }
 
+/**
+ * Rename the tab this process is running in.
+ *
+ * `warpctrl` needs Settings > Scripting, which is off by default and absent on
+ * Windows — so relying on it alone made `isub_set_tab_title` a silent no-op for
+ * nearly every Warp user, even though every agent is instructed to call it as
+ * its first action. OSC 0 is the portable fallback: it is what a shell prompt
+ * already does, costs no cells and moves no cursor, so a TUI repaint is safe.
+ */
 export function warpRenameTab(title: string): void {
-  if (!isWarpctrlAvailable()) return;
+  const safe = sanitizeTitle(title);
+  if (isWarpctrlAvailable()) {
+    try {
+      warpctrl(["tab", "rename", safe]);
+      return;
+    } catch {
+      /* fall through to OSC */
+    }
+  }
+  if (!process.stdout.isTTY) return;
   try {
-    warpctrl(["tab", "rename", title]);
+    process.stdout.write(`\u001b]0;${safe}\u0007`);
   } catch {
     /* cosmetic */
   }
@@ -750,6 +939,8 @@ export function warpCloseSurface(id: string): void {
   } catch {
     /* best effort */
   }
+  // The tab is gone; leaving its config behind would only clutter Warp's `+` menu.
+  removeTabConfig(id);
   // Reconcile immediately so callers do not observe a zombie "running".
   readStatus(id);
 }
@@ -757,6 +948,7 @@ export function warpCloseSurface(id: string): void {
 /** Remove a surface directory once the parent has consumed its transcript. */
 export function warpDisposeSurface(id: string): void {
   rmSync(surfaceDir(id), { recursive: true, force: true });
+  removeTabConfig(id);
 }
 
 /** Surfaces still on disk — used by supervision/orphan reconciliation. */
@@ -776,21 +968,26 @@ export function listWarpSurfaces(): WarpSurfaceStatus[] {
 // ---------------------------------------------------------------------------
 
 /**
- * Warp tab configs (`~/.warp/tab_configs/*.toml`) can run commands on open, but
- * Warp exposes no URI to open one programmatically. We still emit one per
- * surface so a user whose hook is missing (or whose Warp build blocks
- * `warp://action/new_tab`) can start the pane from the `+` menu by hand.
+ * Write the tab config that launches a surface's pane, returning its name (the
+ * file stem, which is what `warp://tab_config/<name>` matches on).
  */
 export function writeTabConfig(id: string): string {
   const spec = readSpec(id);
   const dir = join(warpDataDir(), "tab_configs");
   mkdirSync(dir, { recursive: true });
-  const file = join(dir, `pi_subagent_${id}.toml`);
-  const bootstrap = bootstrapScriptPath();
+  const name = tabConfigName(id);
+  const shell = spec.shell ?? paneShell();
+  const bootstrap = bootstrapScriptPath(shell);
+  // The bootstrap runs *inside* the pane's shell, so its own `exit` only ends
+  // the script — the tab would sit at a prompt forever and Warp tabs would pile
+  // up one per subagent. Exiting the shell itself is what makes Warp close the
+  // tab. PI_WARP_KEEP_TAB=1 keeps it open to read a launch failure on screen
+  // (out.log keeps it either way).
+  const keepTab = process.env.PI_WARP_KEEP_TAB === "1";
   const cmd =
-    process.platform === "win32"
-      ? `& '${bootstrap}' -SurfaceDir '${surfaceDir(id)}'`
-      : `bash '${bootstrap}' '${surfaceDir(id)}'`;
+    shell === "powershell"
+      ? `& '${bootstrap}' -SurfaceDir '${surfaceDir(id)}'` + (keepTab ? "" : "; exit $LASTEXITCODE")
+      : `bash '${bootstrap}' '${surfaceDir(id)}'` + (keepTab ? "" : "; exit $?");
   const toml = [
     `name = "pi subagent: ${tomlEscape(spec.name)}"`,
     `title = "${tomlEscape(spec.name)}"`,
@@ -803,21 +1000,21 @@ export function writeTabConfig(id: string): string {
     `is_focused = true`,
     "",
   ].join("\n");
-  writeFileSync(file, toml);
-  return file;
+  writeFileSync(join(dir, `${name}.toml`), toml);
+  return name;
+}
+
+function tabConfigName(id: string): string {
+  return `pi_subagent_${id}`;
 }
 
 export function tomlEscape(s: string): string {
   return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
-/** Drop tab configs this package generated. */
-export function cleanupTabConfigs(): void {
-  const dir = join(warpDataDir(), "tab_configs");
-  if (!existsSync(dir)) return;
-  for (const f of readdirSync(dir)) {
-    if (f.startsWith("pi_subagent_")) rmSync(join(dir, f), { force: true });
-  }
+/** Drop the tab config for one surface, so the `+` menu does not accumulate dead entries. */
+function removeTabConfig(id: string): void {
+  rmSync(join(warpDataDir(), "tab_configs", `${tabConfigName(id)}.toml`), { force: true });
 }
 
 /** Diagnostic snapshot for `/doctor`-style output. */
@@ -827,8 +1024,9 @@ export function warpDiagnostics(): Record<string, unknown> {
     warpBin: getWarpBin(),
     warpctrlBin: getWarpctrlBin(),
     warpctrlResponding: getWarpctrlBin() ? isWarpctrlAvailable() : false,
-    hookInstalled: isWarpHookInstalled(),
+    paneShell: paneShell(),
     dataDir: warpDataDir(),
+    tabConfigDir: join(warpDataDir(), "tab_configs"),
     stateDir: warpStateDir(),
     bootstrap: bootstrapScriptPath(),
     tmp: tmpdir(),

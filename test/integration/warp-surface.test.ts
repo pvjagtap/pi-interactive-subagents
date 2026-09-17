@@ -2,12 +2,11 @@
  * End-to-end integration test for the Warp backend.
  *
  * Unlike the psmux/WezTerm surface tests this one drives the Warp-specific
- * handshake directly (surface dir → warp:// tab → pane hook → bootstrap),
+ * handshake directly (surface dir → tab config → warp:// tab → bootstrap),
  * because Warp exposes no pane ids to address.
  *
  * Requirements to actually run:
  *   - pi running inside Warp (TERM_PROGRAM=WarpTerminal)
- *   - the pane hook installed: `node scripts/install-warp-hook.mjs --install`
  *
  * It is skipped (not failed) anywhere else, so CI on Linux/Windows runners
  * without a Warp GUI stays green.
@@ -17,13 +16,16 @@
 import { describe, it, after } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import {
   createWarpSurface,
   isWarpRuntimeAvailable,
+  paneShell,
   readSpec,
   readStatus,
   warpCloseSurface,
+  warpDataDir,
   warpDisposeSurface,
   warpReadScreen,
   warpSendCommand,
@@ -32,9 +34,16 @@ import {
 
 const enabled = isWarpRuntimeAvailable();
 
+// A PowerShell pane has no pty between us and the shell, so it never accepts
+// injected keystrokes and always reads back an empty screen.
+const injectable = paneShell() !== "powershell";
+
 if (!enabled) {
   console.log("⚠️  Warp backend unavailable — skipping warp-surface integration tests");
-  console.log("   Run inside Warp with `node scripts/install-warp-hook.mjs --install`.");
+  console.log("   Run pi inside Warp, or set PI_MUX_BACKEND=warp.");
+} else if (!injectable) {
+  console.log("⚠️  Warp PowerShell pane (direct mode) — skipping screen/input tests");
+  console.log("   Use a Git Bash/MSYS2/WSL pane with PI_WARP_PANE_SHELL=posix for full parity.");
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -61,7 +70,8 @@ describe("warp-surface", { skip: !enabled, timeout: 90_000 }, () => {
     }
   });
 
-  it("opens a Warp tab, runs a command in it, and reads the transcript back", async () => {
+  it("opens a Warp tab, runs a command in it, and reads the transcript back", async (t) => {
+    if (!injectable) return t.skip("pane not injectable (direct mode)");
     const id = createWarpSurface("integ-echo", { cwd: process.cwd() });
     created.push(id);
 
@@ -76,7 +86,8 @@ describe("warp-surface", { skip: !enabled, timeout: 90_000 }, () => {
     );
   });
 
-  it("propagates the exit code through status.json and the done sentinel", async () => {
+  it("propagates the exit code through status.json and the done sentinel", async (t) => {
+    if (!injectable) return t.skip("pane not injectable (direct mode)");
     const id = createWarpSurface("integ-exit", { cwd: process.cwd() });
     created.push(id);
 
@@ -91,7 +102,8 @@ describe("warp-surface", { skip: !enabled, timeout: 90_000 }, () => {
     );
   });
 
-  it("preserves shell special characters sent through the input channel", async () => {
+  it("preserves shell special characters sent through the input channel", async (t) => {
+    if (!injectable) return t.skip("pane not injectable (direct mode)");
     const id = createWarpSurface("integ-escape", { cwd: process.cwd() });
     created.push(id);
 
@@ -104,12 +116,12 @@ describe("warp-surface", { skip: !enabled, timeout: 90_000 }, () => {
     );
   });
 
-  it("emits a manual-fallback tab config that references the surface", () => {
+  it("emits a tab config that launches the bootstrap in the surface dir", () => {
     const id = createWarpSurface("integ-tabconfig", { cwd: process.cwd() });
     created.push(id);
 
-    const file = writeTabConfig(id);
-    const toml = readFileSync(file, "utf8");
+    const name = writeTabConfig(id);
+    const toml = readFileSync(join(warpDataDir(), "tab_configs", `${name}.toml`), "utf8");
     assert.ok(toml.includes(readSpec(id).id), "tab config points at the surface dir");
     assert.ok(toml.includes("pi-warp-bootstrap"), "tab config launches the bootstrap");
   });

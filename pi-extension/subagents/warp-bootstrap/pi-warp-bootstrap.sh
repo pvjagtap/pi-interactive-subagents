@@ -2,8 +2,7 @@
 # pi-warp-bootstrap.sh — pane driver for the Warp backend of
 # pi-interactive-subagents.
 #
-# Invoked by the shell hook (see pi-warp-hook.sh) when an interactive Warp shell
-# starts inside a surface directory, or directly:
+# Invoked as the startup command of a generated Warp tab config, or directly:
 #
 #   bash pi-warp-bootstrap.sh /path/to/surface-dir
 #
@@ -33,6 +32,7 @@ SURFACE_ID="${PI_WARP_ID:-unknown}"
 SURFACE_NAME="${PI_WARP_NAME:-subagent}"
 TARGET_CWD="${PI_WARP_CWD:-$SURFACE_DIR}"
 COMMAND="${PI_WARP_COMMAND:-}"
+COMMAND_FILE="${PI_WARP_COMMAND_FILE:-$SURFACE_DIR/command.txt}"
 LOG="${PI_WARP_LOG:-$SURFACE_DIR/out.log}"
 FIFO="${PI_WARP_INPUT:-$SURFACE_DIR/in.fifo}"
 STATUS="${PI_WARP_STATUS:-$SURFACE_DIR/status.json}"
@@ -40,7 +40,6 @@ STATUS="${PI_WARP_STATUS:-$SURFACE_DIR/status.json}"
 export PI_SUBAGENT_SURFACE="$SURFACE_ID"
 export PI_SUBAGENT_SURFACE_DIR="$SURFACE_DIR"
 export PI_WARP_SURFACE_NAME="$SURFACE_NAME"
-export PI_WARP_HOOK=1
 
 # Strip control bytes from the name before it reaches an OSC string: a name is
 # caller-supplied data, and raw ESC/BEL in a title sequence is escape injection.
@@ -93,14 +92,36 @@ fi
 [ -n "$WIN_COLS" ] && [ "$WIN_COLS" -gt 0 ] 2>/dev/null || WIN_COLS=80
 export LINES="$WIN_ROWS" COLUMNS="$WIN_COLS"
 
-[ -p "$FIFO" ] || { rm -f "$FIFO"; mkfifo "$FIFO"; }
-write_status running
+# Pick up a launch command the parent handed over while the tab was still
+# opening. Opening a Warp tab is an async round trip (URL handler -> app -> rc
+# files -> Warpify -> this script), which outlasts any fixed delay the parent
+# could wait; so the parent drops the command here instead of trying to type it
+# into a pane that does not exist yet.
+#
+# This must happen BEFORE the FIFO exists: the parent uses the FIFO as the
+# "pane is live, type into it" signal, and a write into a FIFO nobody reads yet
+# would just stall until its timeout.
+if [ -z "$COMMAND" ]; then
+  WAIT_MS="${PI_WARP_COMMAND_WAIT_MS:-15000}"
+  WAITED=0
+  while [ -z "$COMMAND" ] && [ "$WAITED" -lt "$WAIT_MS" ]; do
+    if [ -f "$COMMAND_FILE" ]; then
+      COMMAND=$(cat "$COMMAND_FILE")
+      break
+    fi
+    sleep 0.1
+    WAITED=$((WAITED + 100))
+  done
+fi
 
 if [ -z "$COMMAND" ]; then
   # Idle surface: interactive shell driven through the same stdin splice, so
   # the parent can `sendCommand` into it exactly like `psmux send-keys`.
   COMMAND="${SHELL:-/bin/bash} -i"
 fi
+
+[ -p "$FIFO" ] || { rm -f "$FIFO"; mkfifo "$FIFO"; }
+write_status running
 
 # Keep a writer open so the FIFO never sees EOF between sends.
 exec 9<>"$FIFO"

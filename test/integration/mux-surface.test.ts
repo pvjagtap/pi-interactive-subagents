@@ -22,11 +22,13 @@ import {
   cleanupTestEnv,
   createTrackedSurface,
   untrackSurface,
+  isInjectable,
   sendCommand,
   sendLongCommand,
   readScreen,
   readScreenAsync,
   closeSurface,
+  isPowerShellTarget,
   sleep,
   uniqueId,
   type TestEnv,
@@ -43,10 +45,22 @@ for (const backend of backends) {
   describe(`mux-surface [${backend}]`, { timeout: 30_000 }, () => {
     let prevMux: string | undefined;
     let env: TestEnv;
+    let injectable = true;
 
-    before(() => {
+    before(async () => {
       prevMux = setBackend(backend);
       env = createTestEnv(backend);
+
+      // A Warp PowerShell pane runs without a pty, so every screen read is "".
+      // Probe once instead of letting six read-based tests report false failures.
+      const probe = createTrackedSurface(env, "injectable-probe");
+      await sleep(1000);
+      injectable = isInjectable(probe);
+      closeSurface(probe);
+      untrackSurface(env, probe);
+      if (!injectable) {
+        console.log(`⚠️  [${backend}] pane is not injectable — skipping screen-read tests`);
+      }
     });
 
     after(() => {
@@ -54,7 +68,8 @@ for (const backend of backends) {
       restoreBackend(prevMux);
     });
 
-    it("creates a surface, sends a command, reads output, and closes it", async () => {
+    it("creates a surface, sends a command, reads output, and closes it", async (t) => {
+      if (!injectable) return t.skip("pane not injectable");
       const surface = createTrackedSurface(env, "echo-test");
       await sleep(1000);
 
@@ -72,13 +87,19 @@ for (const backend of backends) {
       untrackSurface(env, surface);
     });
 
-    it("preserves shell special characters in echo output", async () => {
+    it("preserves shell special characters in echo output", async (t) => {
+      if (!injectable) return t.skip("pane not injectable");
       const surface = createTrackedSurface(env, "escape-test");
       await sleep(1000);
 
       const marker = uniqueId();
-      // Single-quoted string — $ and " are literal inside single quotes
-      sendCommand(surface, `echo 'SPEC_${marker}_$HOME_"quotes"_done'`);
+      // Literal-quoted string — $ and " must survive to the pane verbatim.
+      sendCommand(
+        surface,
+        isPowerShellTarget()
+          ? `Write-Host 'SPEC_${marker}_$HOME_"quotes"_done'`
+          : `echo 'SPEC_${marker}_$HOME_"quotes"_done'`,
+      );
       await sleep(1500);
 
       const screen = readScreen(surface, 50);
@@ -93,7 +114,8 @@ for (const backend of backends) {
       );
     });
 
-    it("sends a long command via script file without truncation", async () => {
+    it("sends a long command via script file without truncation", async (t) => {
+      if (!injectable) return t.skip("pane not injectable");
       const surface = createTrackedSurface(env, "long-cmd-test");
       await sleep(1000);
 
@@ -115,7 +137,8 @@ for (const backend of backends) {
       );
     });
 
-    it("reads screen asynchronously", async () => {
+    it("reads screen asynchronously", async (t) => {
+      if (!injectable) return t.skip("pane not injectable");
       const surface = createTrackedSurface(env, "async-read-test");
       await sleep(1000);
 
@@ -130,7 +153,8 @@ for (const backend of backends) {
       );
     });
 
-    it("manages multiple surfaces concurrently", async () => {
+    it("manages multiple surfaces concurrently", async (t) => {
+      if (!injectable) return t.skip("pane not injectable");
       const s1 = createTrackedSurface(env, "multi-1");
       const s2 = createTrackedSurface(env, "multi-2");
       await sleep(1500);
@@ -148,14 +172,20 @@ for (const backend of backends) {
       assert.ok(screen2.includes(`S2_${m2}`), `Surface 2 missing marker. Got:\n${screen2}`);
     });
 
-    it("writes output to a file and verifies via surface", async () => {
+    it("writes output to a file and verifies via surface", async (t) => {
+      if (!injectable) return t.skip("pane not injectable");
       const surface = createTrackedSurface(env, "file-test");
       await sleep(1000);
 
       const marker = uniqueId();
       const filePath = join(tmpdir(), `pi-mux-test-${marker}.txt`);
 
-      sendCommand(surface, `echo "FILE_${marker}" > ${filePath} && echo "WRITTEN_${marker}"`);
+      sendCommand(
+        surface,
+        isPowerShellTarget()
+          ? `Set-Content -Path '${filePath}' -Value "FILE_${marker}"; Write-Host "WRITTEN_${marker}"`
+          : `echo "FILE_${marker}" > ${filePath} && echo "WRITTEN_${marker}"`,
+      );
       await sleep(1500);
 
       const screen = readScreen(surface, 50);

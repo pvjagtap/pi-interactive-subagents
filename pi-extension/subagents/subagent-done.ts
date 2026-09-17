@@ -1,6 +1,7 @@
 /**
  * Extension loaded into sub-agents.
- * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+J)
+ * - Shows agent identity + available tools as a styled widget above the editor
+ *   (toggle with `/subagent-tools`, or a key of your choice via PI_SUBAGENT_WIDGET_KEY)
  * - Provides a `subagent_done` tool for autonomous agents to self-terminate
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -46,6 +47,7 @@ export default function (pi: ExtensionAPI) {
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
+  const toggleHint = process.env.PI_SUBAGENT_WIDGET_KEY ?? "/subagent-tools";
 
   function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
     ctx.ui.setWidget(
@@ -59,7 +61,7 @@ export default function (pi: ExtensionAPI) {
         if (expanded) {
           // Expanded: full tool list + denied
           const countInfo = theme.fg("dim", ` — ${toolNames.length} available`);
-          const hint = theme.fg("muted", "  (Ctrl+J to collapse)");
+          const hint = theme.fg("muted", `  (${toggleHint} to collapse)`);
 
           const toolList = toolNames
             .map((name: string) => theme.fg("dim", name))
@@ -86,7 +88,7 @@ export default function (pi: ExtensionAPI) {
             denied.length > 0
               ? theme.fg("dim", " · ") + theme.fg("error", `${denied.length} denied`)
               : "";
-          const hint = theme.fg("muted", "  (Ctrl+J to expand)");
+          const hint = theme.fg("muted", `  (${toggleHint} to expand)`);
 
           const content = new Text(`${agentTag}${countInfo}${deniedInfo}${hint}`, 0, 0);
           box.addChild(content);
@@ -100,6 +102,18 @@ export default function (pi: ExtensionAPI) {
 
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
 
+  let finished = false;
+
+  // The parent polls for this sidecar; writing it is what ends its wait.
+  function finish(ctx: { shutdown: () => void }): void {
+    finished = true;
+    const sessionFile = process.env.PI_SUBAGENT_SESSION;
+    if (sessionFile) {
+      writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+    }
+    ctx.shutdown();
+  }
+
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
     const tools = pi.getAllTools();
@@ -109,47 +123,100 @@ export default function (pi: ExtensionAPI) {
     renderWidget(ctx, null);
   });
 
-  // Auto-exit: when the agent loop ends, shut down automatically.
-  // If the user interrupts (Escape) or sends any input, auto-exit is disabled
-  // for that cycle — the user wants to steer. Once they're done and the agent
-  // completes normally again, auto-exit re-engages.
-  // Enabled via `auto-exit: true` in agent frontmatter.
-  if (autoExit) {
-    let userTookOver = false;
-    let agentStarted = false;
+  // session_start can sample the registry before every tool is in it, which
+  // made the widget report "1 tools" while the agent actually had dozens.
+  pi.on("agent_start", (_event, ctx) => {
+    const names = pi.getAllTools().map((t) => t.name).sort();
+    if (names.length === toolNames.length) return;
+    toolNames = names;
+    renderWidget(ctx, null);
+  });
 
-    pi.on("agent_start", () => {
-      agentStarted = true;
-    });
+  // A user keystroke after the agent started means they want to steer, which
+  // suspends both the auto-exit path and the done-nudge for that cycle.
+  let userTookOver = false;
+  let agentStarted = false;
+  let nudged = false;
 
-    pi.on("input", () => {
-      // Ignore the initial task message that starts an autonomous subagent.
-      // Only inputs after the first agent run has started count as user takeover.
-      if (!shouldMarkUserTookOver(agentStarted)) return;
-      userTookOver = true;
-    });
+  pi.on("agent_start", () => {
+    agentStarted = true;
+  });
 
-    pi.on("agent_end", (event, ctx) => {
-      const messages = (event as any).messages as any[] | undefined;
-      const shouldExit = shouldAutoExitOnAgentEnd(userTookOver, messages);
-      if (!shouldExit) {
-        // User sent input after the agent had started, or the run was interrupted
-        // with Escape. Reset takeover so auto-exit can re-engage on the next
-        // normal completion cycle.
-        userTookOver = false;
-        return;
-      }
+  pi.on("input", (event) => {
+    // Our own reminder arrives as source "extension"; only a real keystroke
+    // means the user wants to steer.
+    if ((event as any).source !== "interactive") return;
+    // Ignore the initial task message that starts an autonomous subagent.
+    // Only inputs after the first agent run has started count as user takeover.
+    if (!shouldMarkUserTookOver(agentStarted)) return;
+    userTookOver = true;
+  });
 
+  pi.on("agent_end", (event, ctx) => {
+    if (finished) return;
+    const messages = (event as any).messages as any[] | undefined;
+    const shouldExit = shouldAutoExitOnAgentEnd(userTookOver, messages);
+    if (!shouldExit) {
+      // User sent input after the agent had started, or the run was interrupted
+      // with Escape. Reset takeover so auto-exit can re-engage on the next
+      // normal completion cycle.
+      userTookOver = false;
+      return;
+    }
+
+    if (autoExit) {
       ctx.shutdown();
+      return;
+    }
+
+    // An interactive subagent is supposed to call subagent_done itself, but a
+    // model that reads "…and then stop" in its task just ends the turn — and the
+    // parent polls forever. Ask once, then end the session on its behalf.
+    if (!nudged) {
+      nudged = true;
+      pi.sendUserMessage(
+        "Your task looks finished. Call the subagent_done tool now to hand your result back to the parent agent. " +
+          "If work remains, keep going and call it when you are done.",
+      );
+      return;
+    }
+
+    finish(ctx);
+  });
+
+  pi.registerCommand("subagent-tools", {
+    description: "Toggle the subagent tools widget",
+    async handler(_args, ctx) {
+      expanded = !expanded;
+      renderWidget(ctx, null);
+    },
+  });
+
+  // Keys are resolved from user config, so any hardcoded default can collide and
+  // print an "Extension issues" banner in every subagent pane. Opt in instead.
+  const widgetKey = process.env.PI_SUBAGENT_WIDGET_KEY;
+  if (widgetKey) {
+    pi.registerShortcut(widgetKey, {
+      description: "Toggle subagent tools widget",
+      handler: (ctx) => {
+        expanded = !expanded;
+        renderWidget(ctx, null);
+      },
     });
   }
 
-  // Toggle expand/collapse with Ctrl+J
-  pi.registerShortcut("ctrl+j", {
-    description: "Toggle subagent tools widget",
-    handler: (ctx) => {
-      expanded = !expanded;
-      renderWidget(ctx, null);
+  pi.registerTool({
+    name: "set_tab_title",
+    label: "Set Tab Title",
+    description:
+      "Set this pane's tab title so the user can see what you are working on. " +
+      "Start the title with your agent tag, e.g. \"[reviewer] Auditing auth module\".",
+    parameters: Type.Object({
+      title: Type.String({ description: "Short title for this pane" }),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      ctx.ui.setTitle(params.title);
+      return { content: [{ type: "text", text: `Tab title set to: ${params.title}` }], details: {} };
     },
   });
 
@@ -178,6 +245,7 @@ export default function (pi: ExtensionAPI) {
         message: params.message,
       };
       writeFileSync(`${sessionFile}.exit`, JSON.stringify(exitData));
+      finished = true;
 
       ctx.shutdown();
       return {
@@ -196,11 +264,7 @@ export default function (pi: ExtensionAPI) {
       "Your LAST assistant message before calling this becomes the summary returned to the caller.",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (sessionFile) {
-        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
-      }
-      ctx.shutdown();
+      finish(ctx);
       return {
         content: [{ type: "text", text: "Shutting down subagent session." }],
         details: {},

@@ -41,30 +41,28 @@ psmux new -s pi -- pi
 
 ### Warp
 
-Warp is supported on **Linux and Windows**. It ships no multiplexer CLI, so a
-guarded shell-profile hook hands each newly opened tab to the pane bootstrap —
-that is the only setup step:
+Warp is supported on **Linux, Windows and macOS**, with no setup step. It ships no
+multiplexer CLI, so each subagent gets a generated Warp **tab config** carrying its
+working directory and startup command, opened with `warp://tab_config/<name>`.
 
-```bash
-node scripts/install-warp-hook.mjs --install     # add the hook
-node scripts/install-warp-hook.mjs --status      # check what is installed
-node scripts/install-warp-hook.mjs --uninstall   # fully reversible
-```
-
-Then open a **new** Warp tab. Until the hook is present, Warp is not advertised as
-a backend and the setup hint explains why. Sub-agents finish by calling the
-`subagent_done` tool — it writes an exit sidecar file that the parent polls — so
-nothing depends on screen scraping and no one types `/exit`.
+Sub-agents finish by calling the `subagent_done` tool — it writes an exit sidecar
+file that the parent polls — so nothing depends on screen scraping and no one
+types `/exit`.
 
 | Variable | Purpose |
 | -------- | ------- |
 | `PI_MUX_BACKEND=warp` | force the Warp backend |
+| `PI_WARP_PANE_SHELL` | `posix` or `powershell` — which shell the pane runs (default: `powershell` on Windows) |
 | `PI_WARP_SUBMIT_KEY` | key used to submit a line (`cr` default; LF does not submit in raw-mode TUIs) |
 | `PI_WARP_SCREEN=raw` | return the stripped transcript instead of the rendered screen |
 | `PI_WARP_NO_LAUNCH=1` | prepare surfaces without opening any UI (tests/dry-runs) |
 
-On Windows, Git Bash / MSYS2 / WSL panes get full parity; PowerShell panes run in
-a reduced "direct mode" (launch and completion work, live injection does not).
+On Windows, full parity needs a pane shell that has util-linux's `script` (the pty) —
+that means **WSL** or **MSYS2 with util-linux**, not plain Git Bash. Set
+`PI_WARP_PANE_SHELL=posix` for those. A **PowerShell pane runs in direct mode**: it
+launches the sub-agent and reports completion, but there is no pty in between, so live
+keystroke injection and screen reads are unavailable and fail with an explicit error
+instead of silently doing nothing.
 See [docs/warp-backend.md](docs/warp-backend.md) for the full guide and platform
 matrix, and [ADR-0011](docs/adr/0011-warp-terminal-class-1-backend.md) for the design.
 
@@ -421,14 +419,18 @@ spawning: false
 
 ## Tools Widget
 
-Every sub-agent session displays a compact tools widget showing available and denied tools. Toggle with `Ctrl+J`:
+Every sub-agent session displays a compact tools widget showing available and denied tools. Toggle it with the `/subagent-tools` command:
 
 ```
-[scout] — 12 tools · 4 denied  (Ctrl+J)              ← collapsed
-[scout] — 12 available  (Ctrl+J to collapse)          ← expanded
+[scout] — 12 tools · 4 denied  (/subagent-tools)              ← collapsed
+[scout] — 12 available  (/subagent-tools to collapse)          ← expanded
   read, bash, edit, write, todo, ...
   denied: isub, isub_list, ...
 ```
+
+Set `PI_SUBAGENT_WIDGET_KEY` (e.g. `ctrl+e`) to bind a key instead. No key is bound by
+default: pi resolves keybindings from user config, so a hardcoded default collides and
+prints an "Extension issues" banner in every sub-agent pane.
 
 ---
 
@@ -440,7 +442,7 @@ Every sub-agent session displays a compact tools widget showing available and de
   - [tmux](https://github.com/tmux/tmux)
   - [zellij](https://zellij.dev)
   - [WezTerm](https://wezfurlong.org/wezterm/)
-  - [Warp](https://www.warp.dev) (run `node scripts/install-warp-hook.mjs --install` once)
+  - [Warp](https://www.warp.dev)
 
 ```bash
 cmux pi
@@ -451,7 +453,7 @@ zellij --session pi   # then run: pi
 # or
 # just run pi inside WezTerm
 # or
-# just run pi inside Warp (after installing the pane hook)
+# just run pi inside Warp
 ```
 
 Optional backend override:

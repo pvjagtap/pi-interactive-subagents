@@ -23,18 +23,23 @@ import {
   alignUtf8,
   WARP_SURFACE_PROTOCOL,
   createWarpSurface,
+  gcWarpSurfaces,
   isInsideWarp,
-  isWarpHookInstalled,
   isWarpRuntimeAvailable,
+  inputFileName,
   listWarpSurfaces,
+  paneShell,
   readSpec,
   readStatus,
   stripAnsi,
   surfaceDir,
   tomlEscape,
   warpDiagnostics,
+  warpDisposeSurface,
   warpReadScreen,
   warpSendCommand,
+  warpSendText,
+  writeTabConfig,
   renderSurfaceEnv,
   shQuote,
 } from "../pi-extension/subagents/warp.ts";
@@ -450,13 +455,16 @@ describe("warp.ts", () => {
   let warpDir: string;
   let prevState: string | undefined;
   let prevNoLaunch: string | undefined;
+  let prevData: string | undefined;
 
   before(() => {
     warpDir = createTestDir();
     prevState = process.env.PI_WARP_STATE_DIR;
     prevNoLaunch = process.env.PI_WARP_NO_LAUNCH;
+    prevData = process.env.PI_WARP_DATA_DIR;
     process.env.PI_WARP_STATE_DIR = warpDir;
     process.env.PI_WARP_NO_LAUNCH = "1";
+    process.env.PI_WARP_DATA_DIR = join(warpDir, "warp-data");
   });
 
   after(() => {
@@ -464,6 +472,8 @@ describe("warp.ts", () => {
     else process.env.PI_WARP_STATE_DIR = prevState;
     if (prevNoLaunch === undefined) delete process.env.PI_WARP_NO_LAUNCH;
     else process.env.PI_WARP_NO_LAUNCH = prevNoLaunch;
+    if (prevData === undefined) delete process.env.PI_WARP_DATA_DIR;
+    else process.env.PI_WARP_DATA_DIR = prevData;
     rmSync(warpDir, { recursive: true, force: true });
   });
 
@@ -568,19 +578,55 @@ describe("warp.ts", () => {
     });
   });
 
-  describe("availability gating", () => {
-    it("requires the pane hook before Warp is treated as a backend", () => {
-      const prevHook = process.env.PI_WARP_HOOK;
-      delete process.env.PI_WARP_HOOK;
-      try {
-        // No receipt in the temp state dir → not available even inside Warp.
-        assert.equal(isWarpHookInstalled(), false);
-        assert.equal(isWarpRuntimeAvailable(), false);
-      } finally {
-        if (prevHook !== undefined) process.env.PI_WARP_HOOK = prevHook;
-      }
+  describe("tab config launch", () => {
+    it("writes a tab config carrying the pane's launch command", () => {
+      const id = createWarpSurface("tab cfg", { cwd: warpDir });
+      const name = writeTabConfig(id);
+      assert.equal(name, `pi_subagent_${id}`);
+
+      const toml = readFileSync(
+        join(process.env.PI_WARP_DATA_DIR!, "tab_configs", `${name}.toml`),
+        "utf8",
+      );
+      // The command riding along with the tab is what removes the shell hook.
+      assert.match(toml, /^commands = \[".+pi-warp-bootstrap.+"\]$/m);
+      assert.match(toml, /^type = "terminal"$/m);
+      assert.ok(toml.includes(tomlEscape(surfaceDir(id))));
     });
 
+    it("removes the tab config when the surface is disposed", () => {
+      const id = createWarpSurface("disposable", { cwd: warpDir });
+      const file = join(
+        process.env.PI_WARP_DATA_DIR!,
+        "tab_configs",
+        `${writeTabConfig(id)}.toml`,
+      );
+      assert.equal(existsSync(file), true);
+      warpDisposeSurface(id);
+      assert.equal(existsSync(file), false);
+    });
+
+    it("exits the pane shell so Warp closes the tab, unless PI_WARP_KEEP_TAB", () => {
+      const tomlFor = (id: string) =>
+        readFileSync(
+          join(process.env.PI_WARP_DATA_DIR!, "tab_configs", `${writeTabConfig(id)}.toml`),
+          "utf8",
+        );
+
+      assert.match(tomlFor(createWarpSurface("self closing", { cwd: warpDir })), /; exit /);
+
+      const prev = process.env.PI_WARP_KEEP_TAB;
+      process.env.PI_WARP_KEEP_TAB = "1";
+      try {
+        assert.doesNotMatch(tomlFor(createWarpSurface("sticky", { cwd: warpDir })), /; exit /);
+      } finally {
+        if (prev === undefined) delete process.env.PI_WARP_KEEP_TAB;
+        else process.env.PI_WARP_KEEP_TAB = prev;
+      }
+    });
+  });
+
+  describe("availability gating", () => {
     it("never claims availability outside Warp without an explicit override", () => {
       const prevTerm = process.env.TERM_PROGRAM;
       const prevUuid = process.env.WARP_TERMINAL_SESSION_UUID;
@@ -605,7 +651,14 @@ describe("warp.ts", () => {
   describe("warpDiagnostics", () => {
     it("reports every field the doctor output needs", () => {
       const d = warpDiagnostics();
-      for (const key of ["insideWarp", "hookInstalled", "dataDir", "stateDir", "bootstrap", "platform"]) {
+      for (const key of [
+        "insideWarp",
+        "tabConfigDir",
+        "dataDir",
+        "stateDir",
+        "bootstrap",
+        "platform",
+      ]) {
         assert.ok(key in d, `missing ${key}`);
       }
     });
@@ -703,13 +756,16 @@ describe("warp backend review regressions", () => {
   let warpDir: string;
   let prevState: string | undefined;
   let prevNoLaunch: string | undefined;
+  let prevData: string | undefined;
 
   before(() => {
     warpDir = createTestDir();
     prevState = process.env.PI_WARP_STATE_DIR;
     prevNoLaunch = process.env.PI_WARP_NO_LAUNCH;
+    prevData = process.env.PI_WARP_DATA_DIR;
     process.env.PI_WARP_STATE_DIR = warpDir;
     process.env.PI_WARP_NO_LAUNCH = "1";
+    process.env.PI_WARP_DATA_DIR = join(warpDir, "warp-data");
   });
 
   after(() => {
@@ -717,6 +773,8 @@ describe("warp backend review regressions", () => {
     else process.env.PI_WARP_STATE_DIR = prevState;
     if (prevNoLaunch === undefined) delete process.env.PI_WARP_NO_LAUNCH;
     else process.env.PI_WARP_NO_LAUNCH = prevNoLaunch;
+    if (prevData === undefined) delete process.env.PI_WARP_DATA_DIR;
+    else process.env.PI_WARP_DATA_DIR = prevData;
     rmSync(warpDir, { recursive: true, force: true });
   });
 
@@ -744,7 +802,9 @@ describe("warp backend review regressions", () => {
     });
   });
 
-  describe("shell quoting (surface.env)", () => {
+  // `/bin/sh` is the whole point of these two: they prove the quoting survives a
+  // real POSIX shell. There is nothing to prove, and no /bin/sh, on Windows.
+  describe("shell quoting (surface.env)", { skip: process.platform === "win32" }, () => {
     it("neutralises quotes, backslashes and command substitution", () => {
       const nasty = `it's \\ "q" $(touch /tmp/PWNED) \`id\``;
       const quoted = shQuote(nasty);
@@ -783,14 +843,78 @@ describe("warp backend review regressions", () => {
   });
 
   describe("send-before-ready", () => {
+    it("hands the first command to the pane through the command file", () => {
+      const id = createWarpSurface("deferred", { cwd: warpDir });
+      assert.equal(readStatus(id)?.state, "starting");
+      // Opening a Warp tab outlasts any delay the parent can wait, so the launch
+      // command is dropped for the bootstrap to pick up instead of being typed
+      // into a pane that does not exist yet.
+      warpSendCommand(id, "echo hi");
+      const spec = readSpec(id)!;
+      assert.equal(readFileSync(spec.commandFile, "utf8").trimEnd(), "echo hi");
+      assert.equal(existsSync(spec.input), false, "no pane means no input pipe yet");
+    });
+
     it("reports a starting pane as retryable, not as a dead one", () => {
       const id = createWarpSurface("not-ready", { cwd: warpDir });
-      assert.equal(readStatus(id)?.state, "starting");
       assert.throws(
-        () => warpSendCommand(id, "echo hi"),
+        () => warpSendText(id, "echo hi"),
         /still starting/,
         "must not claim the pane closed before it ever opened",
       );
+    });
+  });
+
+  describe("pane shell selection", () => {
+    it("follows PI_WARP_PANE_SHELL rather than the parent platform", () => {
+      const prev = process.env.PI_WARP_PANE_SHELL;
+      try {
+        process.env.PI_WARP_PANE_SHELL = "posix";
+        assert.equal(paneShell(), "posix");
+        assert.equal(inputFileName(paneShell()), "in.fifo");
+        const id = createWarpSurface("posix-pane", { cwd: warpDir });
+        assert.equal(readSpec(id)?.shell, "posix");
+
+        process.env.PI_WARP_PANE_SHELL = "pwsh";
+        assert.equal(paneShell(), "powershell");
+        assert.equal(inputFileName(paneShell()), "in.cmd");
+      } finally {
+        if (prev === undefined) delete process.env.PI_WARP_PANE_SHELL;
+        else process.env.PI_WARP_PANE_SHELL = prev;
+      }
+    });
+
+    it("refuses keystroke injection into a PowerShell pane instead of dropping it", () => {
+      const id = createWarpSurface("ps-pane", { cwd: warpDir, shell: "powershell" });
+      // Make it look live so we get past the start-up guard.
+      const spec = readSpec(id)!;
+      writeFileSync(spec.input, "");
+      writeFileSync(
+        spec.status,
+        JSON.stringify({ id, state: "running", injectable: false, updatedAt: Date.now() }),
+      );
+      assert.throws(() => warpSendText(id, "hi"), /PI_WARP_PANE_SHELL=posix/);
+    });
+  });
+
+  describe("surface garbage collection", () => {
+    it("prunes exited surfaces past the TTL and keeps live ones", () => {
+      const live = createWarpSurface("gc-live", { cwd: warpDir });
+      const dead = createWarpSurface("gc-dead", { cwd: warpDir });
+      writeFileSync(
+        readSpec(dead)!.status,
+        JSON.stringify({ id: dead, state: "exited", exitCode: 0, updatedAt: 0 }),
+      );
+      const prev = process.env.PI_WARP_SURFACE_TTL_MS;
+      try {
+        process.env.PI_WARP_SURFACE_TTL_MS = "1";
+        gcWarpSurfaces();
+      } finally {
+        if (prev === undefined) delete process.env.PI_WARP_SURFACE_TTL_MS;
+        else process.env.PI_WARP_SURFACE_TTL_MS = prev;
+      }
+      assert.equal(existsSync(surfaceDir(dead)), false, "stale exited surface must be reaped");
+      assert.equal(existsSync(surfaceDir(live)), true, "a starting surface must survive");
     });
   });
 
@@ -817,13 +941,16 @@ describe("warp readTail UTF-8 alignment", () => {
   let dir: string;
   let prevState: string | undefined;
   let prevNoLaunch: string | undefined;
+  let prevData: string | undefined;
 
   before(() => {
     dir = createTestDir();
     prevState = process.env.PI_WARP_STATE_DIR;
     prevNoLaunch = process.env.PI_WARP_NO_LAUNCH;
+    prevData = process.env.PI_WARP_DATA_DIR;
     process.env.PI_WARP_STATE_DIR = dir;
     process.env.PI_WARP_NO_LAUNCH = "1";
+    process.env.PI_WARP_DATA_DIR = join(dir, "warp-data");
   });
 
   after(() => {
@@ -831,6 +958,8 @@ describe("warp readTail UTF-8 alignment", () => {
     else process.env.PI_WARP_STATE_DIR = prevState;
     if (prevNoLaunch === undefined) delete process.env.PI_WARP_NO_LAUNCH;
     else process.env.PI_WARP_NO_LAUNCH = prevNoLaunch;
+    if (prevData === undefined) delete process.env.PI_WARP_DATA_DIR;
+    else process.env.PI_WARP_DATA_DIR = prevData;
     delete process.env.PI_WARP_LOG_TAIL_BYTES;
     rmSync(dir, { recursive: true, force: true });
   });
