@@ -1,7 +1,9 @@
 node_modules/
+# Local pi config. Do NOT track .pi/settings.json: if a contributor also has
+# this package installed, loading it twice registers the isub*/artifact tools
+# twice and pi refuses to start.
 .pi/*
 !.pi/skills/
-!.pi/settings.json
 
 # VS Code local history
 .history/
