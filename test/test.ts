@@ -916,6 +916,31 @@ describe("warp backend review regressions", () => {
       assert.equal(existsSync(surfaceDir(dead)), false, "stale exited surface must be reaped");
       assert.equal(existsSync(surfaceDir(live)), true, "a starting surface must survive");
     });
+
+    it("reaps a surface abandoned in 'starting' past the start budget", () => {
+      const stuck = createWarpSurface("gc-stuck", { cwd: warpDir });
+      const fresh = createWarpSurface("gc-fresh", { cwd: warpDir });
+      // A tab config that never opened: no pid to test liveness against.
+      writeFileSync(
+        readSpec(stuck)!.status,
+        JSON.stringify({ id: stuck, state: "starting", updatedAt: 1 }),
+      );
+      const prevStart = process.env.PI_WARP_START_TIMEOUT_MS;
+      const prevTtl = process.env.PI_WARP_SURFACE_TTL_MS;
+      try {
+        // Long enough that the just-created surface is still within budget.
+        process.env.PI_WARP_START_TIMEOUT_MS = "30000";
+        process.env.PI_WARP_SURFACE_TTL_MS = "1";
+        gcWarpSurfaces();
+      } finally {
+        if (prevStart === undefined) delete process.env.PI_WARP_START_TIMEOUT_MS;
+        else process.env.PI_WARP_START_TIMEOUT_MS = prevStart;
+        if (prevTtl === undefined) delete process.env.PI_WARP_SURFACE_TTL_MS;
+        else process.env.PI_WARP_SURFACE_TTL_MS = prevTtl;
+      }
+      assert.equal(existsSync(surfaceDir(stuck)), false, "abandoned surface must be reaped");
+      assert.equal(existsSync(surfaceDir(fresh)), true, "a just-created surface must survive");
+    });
   });
 
   describe("bounded transcript reads", () => {

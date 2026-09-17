@@ -381,7 +381,13 @@ export function gcWarpSurfaces(): void {
 
   for (const id of entries) {
     const status = readStatus(id);
-    if (status && status.state !== "exited") continue;
+    // readStatus turns a dead "running" pane into "exited". Nothing does that
+    // for "starting": a tab config that never opened leaves no pid to test, so
+    // without the start budget the directory would be skipped forever.
+    const abandoned =
+      status?.state === "starting" &&
+      Date.now() - (status.updatedAt ?? 0) > startTimeoutMs();
+    if (status && status.state !== "exited" && !abandoned) continue;
     let at = status?.updatedAt ?? 0;
     if (!at) {
       try {
