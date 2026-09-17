@@ -1,7 +1,7 @@
 {
   "name": "pi-interactive-subagents",
   "version": "2.1.0",
-  "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions in psmux terminals (Windows)",
+  "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions in psmux, WezTerm, or Warp terminals (Linux + Windows)",
   "keywords": [
     "pi-package"
   ],
@@ -13,7 +13,9 @@
   },
   "type": "module",
   "scripts": {
-    "test": "node --test test/test.ts"
+    "test": "node --test test/test.ts",
+    "warp:hook": "node scripts/install-warp-hook.mjs",
+    "test:integration:warp": "node --test test/integration/warp-surface.test.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

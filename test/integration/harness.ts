@@ -2,7 +2,7 @@
  * Integration test harness for pi-interactive-subagents.
  *
  * Provides utilities to:
- * - Detect available mux backends (cmux, tmux)
+ * - Detect available mux backends (psmux, wezterm, warp)
  * - Create isolated test environments with test agent definitions
  * - Start real pi sessions in mux surfaces
  * - Poll for file creation and screen output
@@ -65,34 +65,34 @@ export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 
 /**
  * Detect which mux backends are actually available in the current environment.
- * Temporarily sets PI_SUBAGENT_MUX to probe each backend.
+ * Temporarily sets PI_MUX_BACKEND to probe each backend.
  */
 export function getAvailableBackends(): MuxBackend[] {
   const backends: MuxBackend[] = [];
-  const orig = process.env.PI_SUBAGENT_MUX;
+  const orig = process.env.PI_MUX_BACKEND;
 
-  for (const backend of ["cmux", "tmux"] as MuxBackend[]) {
-    process.env.PI_SUBAGENT_MUX = backend;
+  for (const backend of ["psmux", "wezterm", "warp"] as MuxBackend[]) {
+    process.env.PI_MUX_BACKEND = backend;
     try {
       if (getMuxBackend() === backend) backends.push(backend);
     } catch {}
   }
 
-  if (orig === undefined) delete process.env.PI_SUBAGENT_MUX;
-  else process.env.PI_SUBAGENT_MUX = orig;
+  if (orig === undefined) delete process.env.PI_MUX_BACKEND;
+  else process.env.PI_MUX_BACKEND = orig;
 
   return backends;
 }
 
 export function setBackend(backend: MuxBackend): string | undefined {
-  const prev = process.env.PI_SUBAGENT_MUX;
-  process.env.PI_SUBAGENT_MUX = backend;
+  const prev = process.env.PI_MUX_BACKEND;
+  process.env.PI_MUX_BACKEND = backend;
   return prev;
 }
 
 export function restoreBackend(prev: string | undefined): void {
-  if (prev === undefined) delete process.env.PI_SUBAGENT_MUX;
-  else process.env.PI_SUBAGENT_MUX = prev;
+  if (prev === undefined) delete process.env.PI_MUX_BACKEND;
+  else process.env.PI_MUX_BACKEND = prev;
 }
 
 // ── Test environment ──

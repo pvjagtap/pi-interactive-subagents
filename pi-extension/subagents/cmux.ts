@@ -6,7 +6,19 @@ import { basename, dirname, join } from "node:path";
 
 const execFileAsync = promisify(execFile);
 
-export type MuxBackend = "psmux" | "wezterm";
+import {
+  createWarpSurface,
+  isWarpRuntimeAvailable,
+  warpCloseSurface,
+  warpReadScreen,
+  warpReadScreenAsync,
+  warpRenameTab,
+  warpSendCommand,
+  warpSendEscape,
+  warpSetupHint,
+} from "./warp.ts";
+
+export type MuxBackend = "psmux" | "wezterm" | "warp";
 
 const commandAvailability = new Map<string, boolean>();
 
@@ -127,14 +139,22 @@ export function isWeztermAvailable(): boolean {
   return isWeztermRuntimeAvailable();
 }
 
+export function isWarpAvailable(): boolean {
+  return isWarpRuntimeAvailable();
+}
+
 export function getMuxBackend(): MuxBackend | null {
   // Allow user override via env var (e.g. PI_MUX_BACKEND=wezterm when both are available)
   const override = process.env.PI_MUX_BACKEND?.trim().toLowerCase();
   if (override === "psmux" && isPsmuxRuntimeAvailable()) return "psmux";
   if (override === "wezterm" && isWeztermRuntimeAvailable()) return "wezterm";
+  if (override === "warp" && isWarpRuntimeAvailable()) return "warp";
 
   if (isPsmuxRuntimeAvailable()) return "psmux";
   if (isWeztermRuntimeAvailable()) return "wezterm";
+  // Warp last: it is a real terminal rather than a multiplexer, so when pi runs
+  // inside psmux/WezTerm *within* a Warp window we still prefer the mux.
+  if (isWarpRuntimeAvailable()) return "warp";
   return null;
 }
 
@@ -143,7 +163,9 @@ export function isMuxAvailable(): boolean {
 }
 
 export function muxSetupHint(): string {
-  return "Start pi inside psmux (`psmux new -s pi -- pi`) or WezTerm.";
+  const base = "Start pi inside psmux (`psmux new -s pi -- pi`), WezTerm, or Warp.";
+  // Inside Warp the actionable fix is almost always the missing pane hook.
+  return process.env.TERM_PROGRAM === "WarpTerminal" ? `${base} ${warpSetupHint()}` : base;
 }
 
 function requireMuxBackend(): MuxBackend {
@@ -203,6 +225,7 @@ export function exitStatusVar(): string {
 export function isPowerShellTarget(): boolean {
   // psmux on Windows → panes are always PowerShell.
   // WezTerm on Windows → panes default to PowerShell.
+  // Warp on Windows → panes default to PowerShell too.
   if (process.platform === "win32") return true;
 
   // Non-Windows: use parent shell hints as a best-effort fallback.
@@ -249,6 +272,12 @@ function tailLines(text: string, lines: number): string {
 export function createSurface(name: string): string {
   const backend = requireMuxBackend();
 
+  if (backend === "warp") {
+    // Warp has no pane ids we can address, so the surface directory id *is*
+    // the handle. See warp.ts for the handshake protocol.
+    return createWarpSurface(name, { mode: "tab" });
+  }
+
   if (backend === "wezterm") {
     const bin = weztermBin();
     // Spawn a new tab instead of splitting — each subagent gets full terminal width
@@ -279,6 +308,10 @@ export function createSurfaceSplit(
   fromSurface?: string,
 ): string {
   const backend = requireMuxBackend();
+
+  if (backend === "warp") {
+    return createWarpSurface(name, { mode: "split", direction });
+  }
 
   if (backend === "wezterm") {
     const bin = weztermBin();
@@ -349,6 +382,11 @@ export function createSurfaceSplit(
 export function renameCurrentTab(title: string): void {
   const backend = requireMuxBackend();
 
+  if (backend === "warp") {
+    warpRenameTab(title);
+    return;
+  }
+
   if (backend === "wezterm") {
     const bin = weztermBin();
     const paneId = process.env.WEZTERM_PANE;
@@ -377,6 +415,12 @@ export function renameCurrentTab(title: string): void {
  */
 export function renameWorkspace(title: string): void {
   const backend = requireMuxBackend();
+
+  if (backend === "warp") {
+    // Warp has no workspace concept; the closest analogue is the tab title.
+    warpRenameTab(title);
+    return;
+  }
 
   if (backend === "wezterm") {
     const bin = weztermBin();
@@ -411,6 +455,11 @@ export function renameWorkspace(title: string): void {
 export function sendCommand(surface: string, command: string): void {
   const backend = requireMuxBackend();
 
+  if (backend === "warp") {
+    warpSendCommand(surface, command);
+    return;
+  }
+
   if (backend === "wezterm") {
     const bin = weztermBin();
     // --no-paste sends raw text; append newline to execute.
@@ -433,6 +482,11 @@ export function sendCommand(surface: string, command: string): void {
  */
 export function sendEscape(surface: string): void {
   const backend = requireMuxBackend();
+
+  if (backend === "warp") {
+    warpSendEscape(surface);
+    return;
+  }
 
   if (backend === "wezterm") {
     const bin = weztermBin();
@@ -500,6 +554,10 @@ export function sendLongCommand(
 export function readScreen(surface: string, lines = 50): string {
   const backend = requireMuxBackend();
 
+  if (backend === "warp") {
+    return warpReadScreen(surface, lines);
+  }
+
   if (backend === "wezterm") {
     const bin = weztermBin();
     // get-text with --start-line for scrollback; negative = scrollback lines
@@ -524,6 +582,10 @@ export function readScreen(surface: string, lines = 50): string {
  */
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
   const backend = requireMuxBackend();
+
+  if (backend === "warp") {
+    return warpReadScreenAsync(surface, lines);
+  }
 
   if (backend === "wezterm") {
     const bin = weztermBin();
@@ -552,6 +614,11 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
 export function closeSurface(surface: string): void {
   const backend = getMuxBackend();
   if (!backend) return; // Backend unavailable (e.g. during process teardown)
+
+  if (backend === "warp") {
+    warpCloseSurface(surface);
+    return;
+  }
 
   if (backend === "wezterm") {
     const bin = weztermBin();
