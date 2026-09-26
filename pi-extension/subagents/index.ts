@@ -234,12 +234,13 @@ function parseSessionMode(value: string | undefined): SubagentSessionMode | unde
   return undefined;
 }
 
-function parseAgentDefinition(content: string, fallbackName: string): AgentDefinition | null {
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
+export function parseAgentDefinition(content: string, fallbackName: string): AgentDefinition | null {
+  // CRLF-tolerant: files checked out on Windows have \r\n and must still parse.
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (!match) return null;
 
   const frontmatter = match[1];
-  const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
+  const body = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n*/, "").trim();
   const systemPromptMode = getFrontmatterValue(frontmatter, "system-prompt");
 
   return {
@@ -362,7 +363,7 @@ function resolveEffectiveInteractive(
   return !(agentDefs?.autoExit ?? false);
 }
 
-function loadAgentDefaults(agentName: string): AgentDefaults | null {
+function loadAgentDefaults(agentName: string): AgentDefaults {
   const configDir = getAgentConfigDir();
   const paths = [
     join(process.cwd(), ".pi", "agents", `${agentName}.md`),
@@ -376,7 +377,13 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
     if (parsed) return parsed;
   }
 
-  return null;
+  // Fail loud: silently spawning bare on a typo'd or malformed agent name gives you a
+  // subagent with none of the model/thinking/identity you asked for, and no warning.
+  throw new Error(
+    `Agent definition "${agentName}" not found or has invalid frontmatter. Looked in:\n` +
+      paths.map((p) => `  ${p}`).join("\n") +
+      `\nOmit the 'agent' parameter to spawn bare.`,
+  );
 }
 
 function formatElapsed(seconds: number): string {
@@ -1720,12 +1727,11 @@ export default function subagentsExtension(
       const agentName = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
       const task = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
 
-      const defs = loadAgentDefaults(agentName);
-      if (!defs) {
-        ctx.ui.notify(
-          `Agent "${agentName}" not found in ~/.pi/agent/agents/ or .pi/agents/`,
-          "error",
-        );
+      let defs: AgentDefaults;
+      try {
+        defs = loadAgentDefaults(agentName);
+      } catch (err) {
+        ctx.ui.notify((err as Error).message, "error");
         return;
       }
 
