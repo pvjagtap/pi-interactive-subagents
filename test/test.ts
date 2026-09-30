@@ -306,6 +306,28 @@ describe("subagent-done.ts", () => {
     });
   });
 });
+describe("cache keep-alive beacon", () => {
+  const shouldBeacon = (subagentsModule as any).shouldBeacon;
+  const base = { running: 1, busy: false, idleMs: 280_000, everyMs: 270_000 };
+
+  it("fires once the parent has been idle past the cache TTL window", () => {
+    assert.equal(shouldBeacon(base), true);
+  });
+
+  it("stays quiet while idle time is still inside the window", () => {
+    assert.equal(shouldBeacon({ ...base, idleMs: 60_000 }), false);
+  });
+
+  it("stays quiet when no subagent is running or the parent is mid-turn", () => {
+    assert.equal(shouldBeacon({ ...base, running: 0 }), false);
+    assert.equal(shouldBeacon({ ...base, busy: true }), false);
+  });
+
+  it("is disabled by PI_SUBAGENT_BEACON_MS=0", () => {
+    assert.equal(shouldBeacon({ ...base, everyMs: 0 }), false);
+  });
+});
+
 describe("subagents widget rendering", () => {
   it("keeps every rendered line within a very narrow width", () => {
     const testApi = (subagentsModule as any).__test__;

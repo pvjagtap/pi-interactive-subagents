@@ -549,6 +549,71 @@ let latestCtx: ExtensionContext | null = null;
 /** Interval timer for widget re-renders. */
 let widgetInterval: ReturnType<typeof setInterval> | null = null;
 
+// ── Prompt-cache keep-alive beacon ──
+// While the parent waits on subagents it makes no provider request, so its
+// prompt cache (5 min TTL) expires and the next real turn is re-billed as a
+// full cache miss. Fire a no-op turn just before the TTL to refresh it.
+
+/** ExtensionAPI captured at session_start, used to steer beacon messages. */
+let piApi: ExtensionAPI | null = null;
+let parentBusy = false;
+/** Last time the parent talked to the provider (= last cache refresh). */
+let lastParentTurnAt = Date.now();
+let beaconCount = 0;
+
+function beaconIntervalMs(): number {
+  const raw = Number(process.env.PI_SUBAGENT_BEACON_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 270_000; // 4m30s, TTL is 5m
+}
+
+export function shouldBeacon(state: {
+  running: number;
+  busy: boolean;
+  idleMs: number;
+  everyMs: number;
+}): boolean {
+  if (state.everyMs === 0) return false; // disabled
+  if (state.running === 0) return false; // nothing to wait for
+  if (state.busy) return false; // a real turn is already refreshing the cache
+  return state.idleMs >= state.everyMs;
+}
+
+/** Called on every widget tick (only ticks while subagents are running). */
+function maybeBeacon(): void {
+  const every = beaconIntervalMs();
+  if (!piApi) return;
+  if (
+    !shouldBeacon({
+      running: runningSubagents.size,
+      busy: parentBusy,
+      idleMs: Date.now() - lastParentTurnAt,
+      everyMs: every,
+    })
+  )
+    return;
+
+  lastParentTurnAt = Date.now(); // guard against a second beacon before agent_start
+  beaconCount++;
+
+  const names = Array.from(runningSubagents.values())
+    .map((a) => `${a.name} (${formatElapsedMMSS(a.startTime)})`)
+    .join(", ");
+
+  piApi.sendMessage(
+    {
+      customType: "subagent_beacon",
+      content:
+        `[keep-alive beacon #${beaconCount}] Still waiting on: ${names}. ` +
+        `No sub-agent results have arrived — results always come as a separate steer message. ` +
+        `Reply with exactly "ack" and nothing else. Do NOT call tools, do NOT start new work, ` +
+        `do NOT summarize or guess sub-agent output. This message exists only to keep the prompt cache warm.`,
+      display: false,
+      details: { beacon: beaconCount, waitingOn: names },
+    },
+    { triggerTurn: true, deliverAs: "steer" },
+  );
+}
+
 function formatElapsedMMSS(startTime: number): string {
   const seconds = Math.floor((Date.now() - startTime) / 1000);
   const m = Math.floor(seconds / 60);
@@ -619,7 +684,7 @@ function borderBottom(width: number): string {
 function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): string[] {
   const count = agents.length;
   const title = "Subagents";
-  const info = `${count} running`;
+  const info = beaconCount > 0 ? `${count} running · ${beaconCount} beacons` : `${count} running`;
 
   const lines: string[] = [borderTop(title, info, width)];
 
@@ -759,6 +824,7 @@ function startWidgetRefresh() {
   updateWidget(); // immediate first render
   widgetInterval = setInterval(() => {
     updateWidget();
+    maybeBeacon();
   }, 1000);
 }
 
@@ -1105,6 +1171,18 @@ export default function subagentsExtension(
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
+    piApi = pi;
+    lastParentTurnAt = Date.now();
+  });
+
+  // Any real turn also refreshes the prompt cache — reset the beacon clock.
+  pi.on("agent_start", () => {
+    parentBusy = true;
+    lastParentTurnAt = Date.now();
+  });
+  pi.on("agent_end", () => {
+    parentBusy = false;
+    lastParentTurnAt = Date.now();
   });
 
   // Clean up on session shutdown
@@ -1117,6 +1195,8 @@ export default function subagentsExtension(
       agent.abortController?.abort();
     }
     runningSubagents.clear();
+    piApi = null;
+    beaconCount = 0;
   });
 
   // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)

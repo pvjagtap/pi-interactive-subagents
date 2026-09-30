@@ -249,6 +249,20 @@ await caller_ping({
 
 ---
 
+## Prompt-Cache Keep-Alive Beacon
+
+While the parent waits on subagents it makes no provider request, so its prompt cache
+(5 min TTL) expires and the next real turn is re-billed as a full cache miss.
+
+While at least one subagent is running and the parent has been idle for
+`PI_SUBAGENT_BEACON_MS` (default `270000` = 4m30s), the parent steers itself a hidden
+`subagent_beacon` message that asks for a bare `ack` — no tools, no new work. That one
+tiny turn re-reads the cached prefix and refreshes the TTL.
+
+- `PI_SUBAGENT_BEACON_MS=0` disables it.
+- A real turn (subagent result, user message) resets the clock — beacons only fire in true idle gaps.
+- Beacon count shows in the subagents widget header: `╭─ Subagents ── 2 running · 3 beacons ─╮`.
+
 ## The `/isub-plan` Workflow
 
 The `/isub-plan` command orchestrates a full planning-to-implementation pipeline.
