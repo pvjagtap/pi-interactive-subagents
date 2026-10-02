@@ -573,7 +573,6 @@ export function shouldBeacon(state: {
   everyMs: number;
 }): boolean {
   if (state.everyMs === 0) return false; // disabled
-  if (state.running === 0) return false; // nothing to wait for
   if (state.busy) return false; // a real turn is already refreshing the cache
   return state.idleMs >= state.everyMs;
 }
@@ -598,12 +597,13 @@ function maybeBeacon(): void {
   const names = Array.from(runningSubagents.values())
     .map((a) => `${a.name} (${formatElapsedMMSS(a.startTime)})`)
     .join(", ");
+  const context = names ? `Still waiting on: ${names}. ` : "";
 
   piApi.sendMessage(
     {
       customType: "subagent_beacon",
       content:
-        `[keep-alive beacon #${beaconCount}] Still waiting on: ${names}. ` +
+        `[keep-alive beacon #${beaconCount}] ${context}` +
         `No sub-agent results have arrived — results always come as a separate steer message. ` +
         `Reply with exactly "ack" and nothing else. Do NOT call tools, do NOT start new work, ` +
         `do NOT summarize or guess sub-agent output. This message exists only to keep the prompt cache warm.`,
@@ -612,6 +612,21 @@ function maybeBeacon(): void {
     },
     { triggerTurn: true, deliverAs: "steer" },
   );
+}
+
+/** Interval id for the always-on beacon loop, independent of the subagent widget. */
+let beaconInterval: ReturnType<typeof setInterval> | null = null;
+
+function startBeaconLoop() {
+  if (beaconInterval) return;
+  beaconInterval = setInterval(() => maybeBeacon(), 1000);
+}
+
+function stopBeaconLoop() {
+  if (beaconInterval) {
+    clearInterval(beaconInterval);
+    beaconInterval = null;
+  }
 }
 
 function formatElapsedMMSS(startTime: number): string {
@@ -824,7 +839,6 @@ function startWidgetRefresh() {
   updateWidget(); // immediate first render
   widgetInterval = setInterval(() => {
     updateWidget();
-    maybeBeacon();
   }, 1000);
 }
 
@@ -1173,6 +1187,7 @@ export default function subagentsExtension(
     latestCtx = ctx;
     piApi = pi;
     lastParentTurnAt = Date.now();
+    startBeaconLoop(); // keep-alive runs on every session, not just while subagents are running
   });
 
   // Any real turn also refreshes the prompt cache — reset the beacon clock.
@@ -1180,8 +1195,15 @@ export default function subagentsExtension(
     parentBusy = true;
     lastParentTurnAt = Date.now();
   });
-  pi.on("agent_end", () => {
+  pi.on("agent_end", (event) => {
     parentBusy = false;
+    // A turn that errored/aborted never actually reached the provider, so it
+    // did not refresh the prompt cache. Don't reset the clock — let the next
+    // widget tick retry the beacon immediately instead of waiting a full
+    // interval on a stale assumption (this was silently eating cache TTL and
+    // causing full re-bills on the next real turn).
+    const last = event.messages[event.messages.length - 1] as { stopReason?: string } | undefined;
+    if (last?.stopReason === "error" || last?.stopReason === "aborted") return;
     lastParentTurnAt = Date.now();
   });
 
@@ -1191,6 +1213,7 @@ export default function subagentsExtension(
       clearInterval(widgetInterval);
       widgetInterval = null;
     }
+    stopBeaconLoop();
     for (const [_id, agent] of runningSubagents) {
       agent.abortController?.abort();
     }
@@ -1789,7 +1812,9 @@ export default function subagentsExtension(
       const toolCall = task
         ? `Use isub to fork a session. fork: true, name: "Iterate", task: ${JSON.stringify(task)}`
         : `Use isub to fork a session. fork: true, name: "Iterate", task: "The user wants to do some hands-on work. Help them with whatever they need."`;
-      pi.sendUserMessage(toolCall);
+      // deliverAs: queue as a steer if the agent is already mid-turn, instead of
+      // throwing "Agent is already processing" and silently dropping the launch.
+      pi.sendUserMessage(toolCall, { deliverAs: "steer" });
     },
   });
 
@@ -1818,7 +1843,7 @@ export default function subagentsExtension(
       const taskText = task || `You are the ${agentName} agent. Wait for instructions.`;
       const displayName = agentName[0].toUpperCase() + agentName.slice(1);
       const toolCall = `Use isub with agent: "${agentName}", name: "${displayName}", task: ${JSON.stringify(taskText)}`;
-      pi.sendUserMessage(toolCall);
+      pi.sendUserMessage(toolCall, { deliverAs: "steer" });
     },
   });
 
@@ -1950,6 +1975,7 @@ export default function subagentsExtension(
       content = content.replace(/^---\n[\s\S]*?\n---\n*/, "");
       pi.sendUserMessage(
         `<skill name="plan" location="${planSkillPath}">\n${content.trim()}\n</skill>\n\n${task}`,
+        { deliverAs: "steer" },
       );
     },
   });

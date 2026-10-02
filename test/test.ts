@@ -318,8 +318,11 @@ describe("cache keep-alive beacon", () => {
     assert.equal(shouldBeacon({ ...base, idleMs: 60_000 }), false);
   });
 
-  it("stays quiet when no subagent is running or the parent is mid-turn", () => {
-    assert.equal(shouldBeacon({ ...base, running: 0 }), false);
+  it("still fires with no subagents running (keeps cache warm on normal sessions too)", () => {
+    assert.equal(shouldBeacon({ ...base, running: 0 }), true);
+  });
+
+  it("stays quiet while the parent is mid-turn", () => {
     assert.equal(shouldBeacon({ ...base, busy: true }), false);
   });
 
