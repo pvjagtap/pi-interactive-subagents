@@ -265,8 +265,16 @@ That tiny turn re-reads the cached prefix and refreshes the TTL on a cache hit.
 - Startup/resume preserves the cache age. Failed or aborted responses do not reset it.
 - No beacon is sent before the first successful request, after a model switch, or once the
   five-minute cache window has elapsed (e.g. after sleep). Real work re-arms the timer.
+- Beaconing stops after `PI_SUBAGENT_BEACON_MAX_IDLE_MS` (default `1800000` = 30 minutes)
+  with no real turn and no running subagents, so an abandoned session stops paying to keep
+  a cache nobody returns to. Any real work re-arms it.
 - Warming is best-effort: provider eviction and request latency can still cause misses.
-- Beacon count shows in the subagents widget header: `╭─ Subagents ── 2 running · 3 beacons ─╮`.
+  A beacon that reads nothing (`cacheRead == 0`) paid a full cache write because the prompt
+  prefix changed — a system-prompt or tool-set change between runs, not an expired TTL.
+  Those are counted and shown as misses; the beacon cannot prevent them, and the next real
+  turn would have paid the same write anyway.
+- Beacon count shows in the subagents widget header: `╭─ Subagents ── 2 running · 3 beacons ─╮`,
+  with the miss count appended when any occurred: `3 beacons (1 miss)`.
 
 ## The `/isub-plan` Workflow
 
