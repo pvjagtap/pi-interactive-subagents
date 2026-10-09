@@ -254,13 +254,18 @@ await caller_ping({
 While the parent waits on subagents it makes no provider request, so its prompt cache
 (5 min TTL) expires and the next real turn is re-billed as a full cache miss.
 
-While at least one subagent is running and the parent has been idle for
-`PI_SUBAGENT_BEACON_MS` (default `270000` = 4m30s), the parent steers itself a hidden
-`subagent_beacon` message that asks for a bare `ack` — no tools, no new work. That one
-tiny turn re-reads the cached prefix and refreshes the TTL.
+When the parent is idle, with or without subagents, it steers itself a hidden
+`subagent_beacon` message after `PI_SUBAGENT_BEACON_MS` (default and maximum
+`240000` = 4 minutes). The message asks for a bare `ack` — no tools, no new work.
+That tiny turn re-reads the cached prefix and refreshes the TTL on a cache hit.
 
-- `PI_SUBAGENT_BEACON_MS=0` disables it.
-- A real turn (subagent result, user message) resets the clock — beacons only fire in true idle gaps.
+- `PI_SUBAGENT_BEACON_MS=0` disables it; shorter positive intervals are supported.
+- The clock uses the last successful provider request's start timestamp, not run completion.
+  Slow responses and tool execution therefore do not postpone the first beacon past expiry.
+- Startup/resume preserves the cache age. Failed or aborted responses do not reset it.
+- No beacon is sent before the first successful request, after a model switch, or once the
+  five-minute cache window has elapsed (e.g. after sleep). Real work re-arms the timer.
+- Warming is best-effort: provider eviction and request latency can still cause misses.
 - Beacon count shows in the subagents widget header: `╭─ Subagents ── 2 running · 3 beacons ─╮`.
 
 ## The `/isub-plan` Workflow

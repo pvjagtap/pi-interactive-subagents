@@ -310,7 +310,7 @@ describe("cache keep-alive beacon", () => {
   const shouldBeacon = (subagentsModule as any).shouldBeacon;
   const base = { running: 1, busy: false, idleMs: 280_000, everyMs: 270_000 };
 
-  it("fires once the parent has been idle past the cache TTL window", () => {
+  it("fires before the cache expires", () => {
     assert.equal(shouldBeacon(base), true);
   });
 
@@ -328,6 +328,95 @@ describe("cache keep-alive beacon", () => {
 
   it("is disabled by PI_SUBAGENT_BEACON_MS=0", () => {
     assert.equal(shouldBeacon({ ...base, everyMs: 0 }), false);
+  });
+
+  it("does not re-bill expired caches after sleep", () => {
+    assert.equal(shouldBeacon({ ...base, idleMs: 300_000 }), false);
+    assert.equal(shouldBeacon({ ...base, idleMs: 900_000 }), false);
+  });
+
+  it("uses a one-minute margin even with an unsafe interval override", () => {
+    const original = process.env.PI_SUBAGENT_BEACON_MS;
+    try {
+      delete process.env.PI_SUBAGENT_BEACON_MS;
+      assert.equal(subagentsModule.beaconIntervalMs(), 240_000);
+      process.env.PI_SUBAGENT_BEACON_MS = "300000";
+      assert.equal(subagentsModule.beaconIntervalMs(), 240_000);
+      process.env.PI_SUBAGENT_BEACON_MS = "0";
+      assert.equal(subagentsModule.beaconIntervalMs(), 0);
+    } finally {
+      if (original === undefined) delete process.env.PI_SUBAGENT_BEACON_MS;
+      else process.env.PI_SUBAGENT_BEACON_MS = original;
+    }
+  });
+
+  it("anchors the first beacon to the successful request, not run completion or startup", () => {
+    const originalNow = Date.now;
+    const originalInterval = globalThis.setInterval;
+    const originalClear = globalThis.clearInterval;
+    const originalEnv = process.env.PI_SUBAGENT_BEACON_MS;
+    const handlers = new Map<string, Function>();
+    const sent: unknown[] = [];
+    let tick: Function = () => {};
+    let now = 1_000_000;
+    const message = {
+      role: "assistant", provider: "test", model: "test", timestamp: now,
+      stopReason: "stop", usage: { input: 10, cacheRead: 24_000, cacheWrite: 0 },
+    };
+    const ctx = {
+      model: { provider: "test", id: "test" }, isIdle: () => true,
+      sessionManager: { getBranch: () => [{ type: "message", message }] },
+    };
+    const pi = {
+      on: (name: string, handler: Function) => handlers.set(name, handler),
+      registerTool: () => {}, registerCommand: () => {}, registerMessageRenderer: () => {},
+      sendMessage: (value: unknown) => sent.push(value),
+    };
+    try {
+      delete process.env.PI_SUBAGENT_BEACON_MS;
+      Date.now = () => now;
+      globalThis.setInterval = ((callback: Function) => {
+        tick = callback;
+        return { unref() {} };
+      }) as any;
+      globalThis.clearInterval = (() => {}) as any;
+      subagentsModule.default(pi as any);
+      handlers.get("session_start")!({}, ctx);
+      handlers.get("agent_start")!({});
+      handlers.get("message_end")!({ message });
+      now += 90_000; // slow response/tools must not buy an extra 90 seconds of TTL
+      handlers.get("agent_end")!({ messages: [message] });
+      now = message.timestamp + 240_000;
+      tick();
+      assert.equal(sent.length, 1);
+      tick();
+      assert.equal(sent.length, 1, "dispatch stays pending until agent_end");
+      handlers.get("agent_start")!({});
+      handlers.get("message_end")!({ message: { ...message, timestamp: now, stopReason: "error" } });
+      handlers.get("agent_end")!({});
+      now = message.timestamp + 300_000;
+      tick();
+      assert.equal(sent.length, 1, "failed dispatch does not renew the cache clock");
+      handlers.get("session_start")!({}, ctx);
+      tick();
+      assert.equal(sent.length, 1, "resuming an expired request does not renew its cache clock");
+      handlers.get("message_end")!({ message: { ...message, timestamp: now } });
+      now += 240_000;
+      tick();
+      assert.equal(sent.length, 2, "real work re-arms warming");
+      handlers.get("agent_end")!({});
+      handlers.get("model_select")!({});
+      now += 240_000;
+      tick();
+      assert.equal(sent.length, 2, "model switch waits for a successful request");
+    } finally {
+      handlers.get("session_shutdown")?.({}, ctx);
+      Date.now = originalNow;
+      globalThis.setInterval = originalInterval;
+      globalThis.clearInterval = originalClear;
+      if (originalEnv === undefined) delete process.env.PI_SUBAGENT_BEACON_MS;
+      else process.env.PI_SUBAGENT_BEACON_MS = originalEnv;
+    }
   });
 });
 

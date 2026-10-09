@@ -43,6 +43,7 @@ import {
 // /reload re-imports this file, giving fresh module-level state, but closures from
 // the old module keep running.
 const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
+const BEACON_INTERVAL_KEY = Symbol.for("pi-subagents/beacon-interval");
 const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
 const EXIT_HANDLER_KEY = Symbol.for("pi-subagents/exit-handler");
 
@@ -51,6 +52,11 @@ const EXIT_HANDLER_KEY = Symbol.for("pi-subagents/exit-handler");
   if (prevInterval) {
     clearInterval(prevInterval);
     (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
+  }
+  const prevBeaconInterval = (globalThis as any)[BEACON_INTERVAL_KEY];
+  if (prevBeaconInterval) {
+    clearInterval(prevBeaconInterval);
+    (globalThis as any)[BEACON_INTERVAL_KEY] = null;
   }
   const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
   if (prevAbort) prevAbort.abort();
@@ -557,13 +563,27 @@ let widgetInterval: ReturnType<typeof setInterval> | null = null;
 /** ExtensionAPI captured at session_start, used to steer beacon messages. */
 let piApi: ExtensionAPI | null = null;
 let parentBusy = false;
-/** Last time the parent talked to the provider (= last cache refresh). */
-let lastParentTurnAt = Date.now();
+const PROMPT_CACHE_TTL_MS = 300_000;
+/** Request start of the last successful response, not agent completion time. */
+let lastParentTurnAt = 0;
+let beaconPending = false;
 let beaconCount = 0;
 
-function beaconIntervalMs(): number {
+export function beaconIntervalMs(): number {
   const raw = Number(process.env.PI_SUBAGENT_BEACON_MS);
-  return Number.isFinite(raw) && raw >= 0 ? raw : 270_000; // 4m30s, TTL is 5m
+  return Number.isFinite(raw) && raw >= 0 ? Math.min(raw, 240_000) : 240_000;
+}
+
+export function cacheRefreshAt(message: {
+  role: string;
+  timestamp?: number;
+  stopReason?: string;
+  usage?: { input: number; cacheRead: number; cacheWrite: number };
+}): number {
+  if (message.role !== "assistant" || !message.timestamp ||
+      message.stopReason === "error" || message.stopReason === "aborted") return 0;
+  const usage = message.usage;
+  return usage && usage.input + usage.cacheRead + usage.cacheWrite > 0 ? message.timestamp : 0;
 }
 
 export function shouldBeacon(state: {
@@ -574,13 +594,14 @@ export function shouldBeacon(state: {
 }): boolean {
   if (state.everyMs === 0) return false; // disabled
   if (state.busy) return false; // a real turn is already refreshing the cache
-  return state.idleMs >= state.everyMs;
+  // A late timer after sleep cannot warm an expired cache; leave the next write to real work.
+  return state.idleMs >= state.everyMs && state.idleMs < PROMPT_CACHE_TTL_MS;
 }
 
-/** Called on every widget tick (only ticks while subagents are running). */
+/** Called every second, independently of the subagent widget. */
 function maybeBeacon(): void {
   const every = beaconIntervalMs();
-  if (!piApi) return;
+  if (!piApi || !latestCtx || !lastParentTurnAt || beaconPending || !latestCtx.isIdle()) return;
   if (
     !shouldBeacon({
       running: runningSubagents.size,
@@ -591,7 +612,7 @@ function maybeBeacon(): void {
   )
     return;
 
-  lastParentTurnAt = Date.now(); // guard against a second beacon before agent_start
+  beaconPending = true; // dispatch is not evidence of a successful cache refresh
   beaconCount++;
 
   const names = Array.from(runningSubagents.values())
@@ -620,12 +641,15 @@ let beaconInterval: ReturnType<typeof setInterval> | null = null;
 function startBeaconLoop() {
   if (beaconInterval) return;
   beaconInterval = setInterval(() => maybeBeacon(), 1000);
+  (globalThis as any)[BEACON_INTERVAL_KEY] = beaconInterval;
+  beaconInterval.unref?.();
 }
 
 function stopBeaconLoop() {
   if (beaconInterval) {
     clearInterval(beaconInterval);
     beaconInterval = null;
+    (globalThis as any)[BEACON_INTERVAL_KEY] = null;
   }
 }
 
@@ -1186,25 +1210,36 @@ export default function subagentsExtension(
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
     piApi = pi;
-    lastParentTurnAt = Date.now();
+    parentBusy = false;
+    beaconPending = false;
+    lastParentTurnAt = 0;
+    // Resume/reload must preserve cache age instead of pretending startup refreshed it.
+    for (const entry of ctx.sessionManager.getBranch()) {
+      if (entry.type === "compaction" || entry.type === "branch_summary") lastParentTurnAt = 0;
+      if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+      const message = entry.message;
+      if (message.provider !== ctx.model?.provider || message.model !== ctx.model?.id) {
+        lastParentTurnAt = 0;
+        continue;
+      }
+      lastParentTurnAt = cacheRefreshAt(message) || lastParentTurnAt;
+    }
     startBeaconLoop(); // keep-alive runs on every session, not just while subagents are running
   });
 
-  // Any real turn also refreshes the prompt cache — reset the beacon clock.
   pi.on("agent_start", () => {
     parentBusy = true;
-    lastParentTurnAt = Date.now();
   });
-  pi.on("agent_end", (event) => {
+  // Every provider response in a tool loop counts, but failed dispatches do not.
+  pi.on("message_end", (event) => {
+    lastParentTurnAt = cacheRefreshAt(event.message) || lastParentTurnAt;
+  });
+  pi.on("agent_end", () => {
     parentBusy = false;
-    // A turn that errored/aborted never actually reached the provider, so it
-    // did not refresh the prompt cache. Don't reset the clock — let the next
-    // widget tick retry the beacon immediately instead of waiting a full
-    // interval on a stale assumption (this was silently eating cache TTL and
-    // causing full re-bills on the next real turn).
-    const last = event.messages[event.messages.length - 1] as { stopReason?: string } | undefined;
-    if (last?.stopReason === "error" || last?.stopReason === "aborted") return;
-    lastParentTurnAt = Date.now();
+    beaconPending = false;
+  });
+  pi.on("model_select", () => {
+    lastParentTurnAt = 0;
   });
 
   // Clean up on session shutdown
@@ -1219,6 +1254,9 @@ export default function subagentsExtension(
     }
     runningSubagents.clear();
     piApi = null;
+    latestCtx = null;
+    lastParentTurnAt = 0;
+    beaconPending = false;
     beaconCount = 0;
   });
 
