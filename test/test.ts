@@ -330,6 +330,19 @@ describe("cache keep-alive beacon", () => {
     assert.equal(shouldBeacon({ ...base, everyMs: 0 }), false);
   });
 
+  it("gives up on a session nobody came back to", () => {
+    const idle = { ...base, sinceRealTurnMs: 1_800_000, maxIdleMs: 1_800_000 };
+    assert.equal(shouldBeacon({ ...idle, running: 0 }), false);
+    assert.equal(shouldBeacon({ ...idle, running: 1 }), true, "running subagents are real work");
+    assert.equal(shouldBeacon({ ...idle, running: 0, sinceRealTurnMs: 1_799_000 }), true);
+  });
+
+  it("counts a zero-read beacon as a miss, not a refresh", () => {
+    assert.equal(subagentsModule.isCacheMiss({ cacheRead: 0, cacheWrite: 72_785 }), true);
+    assert.equal(subagentsModule.isCacheMiss({ cacheRead: 72_785, cacheWrite: 76 }), false);
+    assert.equal(subagentsModule.isCacheMiss(undefined), false);
+  });
+
   it("does not re-bill expired caches after sleep", () => {
     assert.equal(shouldBeacon({ ...base, idleMs: 300_000 }), false);
     assert.equal(shouldBeacon({ ...base, idleMs: 900_000 }), false);

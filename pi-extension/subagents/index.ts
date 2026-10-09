@@ -566,8 +566,22 @@ let parentBusy = false;
 const PROMPT_CACHE_TTL_MS = 300_000;
 /** Request start of the last successful response, not agent completion time. */
 let lastParentTurnAt = 0;
+/** Same, but ignoring beacons: beacons must not keep a walked-away session alive forever. */
+let lastRealTurnAt = 0;
 let beaconPending = false;
 let beaconCount = 0;
+let beaconMisses = 0;
+
+/** Give up after this long with no real work, like pi core's own idle warming limit. */
+export function beaconMaxIdleMs(): number {
+  const raw = Number(process.env.PI_SUBAGENT_BEACON_MAX_IDLE_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 1_800_000;
+}
+
+/** A warm turn reads the cached prefix; reading nothing means the prefix no longer matched. */
+export function isCacheMiss(usage?: { cacheRead: number; cacheWrite: number }): boolean {
+  return !!usage && usage.cacheRead === 0 && usage.cacheWrite > 0;
+}
 
 export function beaconIntervalMs(): number {
   const raw = Number(process.env.PI_SUBAGENT_BEACON_MS);
@@ -591,9 +605,15 @@ export function shouldBeacon(state: {
   busy: boolean;
   idleMs: number;
   everyMs: number;
+  sinceRealTurnMs?: number;
+  maxIdleMs?: number;
 }): boolean {
   if (state.everyMs === 0) return false; // disabled
   if (state.busy) return false; // a real turn is already refreshing the cache
+  // Warming a cache nobody comes back to just pays rent on an abandoned session.
+  if (state.maxIdleMs && state.running === 0 && (state.sinceRealTurnMs ?? 0) >= state.maxIdleMs) {
+    return false;
+  }
   // A late timer after sleep cannot warm an expired cache; leave the next write to real work.
   return state.idleMs >= state.everyMs && state.idleMs < PROMPT_CACHE_TTL_MS;
 }
@@ -608,6 +628,8 @@ function maybeBeacon(): void {
       busy: parentBusy,
       idleMs: Date.now() - lastParentTurnAt,
       everyMs: every,
+      sinceRealTurnMs: Date.now() - lastRealTurnAt,
+      maxIdleMs: beaconMaxIdleMs(),
     })
   )
     return;
@@ -723,7 +745,8 @@ function borderBottom(width: number): string {
 function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): string[] {
   const count = agents.length;
   const title = "Subagents";
-  const info = beaconCount > 0 ? `${count} running · ${beaconCount} beacons` : `${count} running`;
+  const beaconInfo = beaconMisses > 0 ? `${beaconCount} beacons (${beaconMisses} miss)` : `${beaconCount} beacons`;
+  const info = beaconCount > 0 ? `${count} running · ${beaconInfo}` : `${count} running`;
 
   const lines: string[] = [borderTop(title, info, width)];
 
@@ -1224,6 +1247,7 @@ export default function subagentsExtension(
       }
       lastParentTurnAt = cacheRefreshAt(message) || lastParentTurnAt;
     }
+    lastRealTurnAt = Date.now(); // a fresh session is active by definition
     startBeaconLoop(); // keep-alive runs on every session, not just while subagents are running
   });
 
@@ -1232,7 +1256,17 @@ export default function subagentsExtension(
   });
   // Every provider response in a tool loop counts, but failed dispatches do not.
   pi.on("message_end", (event) => {
-    lastParentTurnAt = cacheRefreshAt(event.message) || lastParentTurnAt;
+    const refreshedAt = cacheRefreshAt(event.message);
+    if (!refreshedAt) return;
+    lastParentTurnAt = refreshedAt;
+    if (beaconPending) {
+      // A beacon that reads nothing paid a full write: the prefix drifted, not the TTL.
+      if (isCacheMiss((event.message as { usage?: { cacheRead: number; cacheWrite: number } }).usage)) {
+        beaconMisses++;
+      }
+      return;
+    }
+    lastRealTurnAt = refreshedAt;
   });
   pi.on("agent_end", () => {
     parentBusy = false;
@@ -1256,8 +1290,10 @@ export default function subagentsExtension(
     piApi = null;
     latestCtx = null;
     lastParentTurnAt = 0;
+    lastRealTurnAt = 0;
     beaconPending = false;
     beaconCount = 0;
+    beaconMisses = 0;
   });
 
   // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
